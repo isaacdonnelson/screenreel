@@ -1,0 +1,3 @@
+import ScreenreelCore
+
+Screenreel.main()

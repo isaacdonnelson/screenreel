@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Linux capture for screenreel.
+
+Writes the same take folder as the Mac binary: raw.mov, events.jsonl, edit.json.
+The picture is rendered on the Mac with `screenreel beautify`. Hide the X cursor
+with ffmpeg x11grab draw_mouse=0 and log the real pointer with xinput.
+"""
+
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+RAW = "raw.mov"
+EVENTS = "events.jsonl"
+EDIT = "edit.json"
+SESSION = "session.json"
+INBOX = "inbox.jsonl"
+LOG = "recorder.log"
+
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    raise SystemExit(0 if payload.get("ok") else 1)
+
+
+def take_path(args):
+    if "--take" not in args:
+        emit({"ok": False, "error": "--take needs a directory"})
+    value = args[args.index("--take") + 1]
+    return os.path.abspath(value)
+
+
+def flag(args, name, default=None):
+    if name not in args:
+        return default
+    return args[args.index(name) + 1]
+
+
+def display_size():
+    display = os.environ.get("DISPLAY", ":0")
+    try:
+        text = subprocess.check_output(["xdpyinfo"], text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return display, 1920, 1200
+    for line in text.splitlines():
+        if "dimensions:" in line:
+            size = line.split("dimensions:")[1].split()[0]
+            width, height = size.split("x")
+            return display, int(width), int(height)
+    return display, 1920, 1200
+
+
+def doctor():
+    missing = []
+    for tool in ("ffmpeg", "xinput", "xdpyinfo"):
+        if subprocess.call(["bash", "-lc", f"command -v {tool}"], stdout=subprocess.DEVNULL) != 0:
+            missing.append(tool)
+    display = os.environ.get("DISPLAY")
+    ok = not missing and bool(display)
+    message = "Ready to record on this X display. The system cursor is hidden in the video."
+    if not display:
+        message = "DISPLAY is not set. This recorder needs the X display the browser is on."
+    elif missing:
+        message = "Install " + ", ".join(missing) + " before recording."
+    emit({
+        "ok": ok,
+        "platform": "linux",
+        "display": display,
+        "missing": missing,
+        "message": message,
+    })
+
+
+def write_json(path, payload):
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
+def record_start(args):
+    take = take_path(args)
+    os.makedirs(take, exist_ok=True)
+    session_path = os.path.join(take, SESSION)
+    if os.path.exists(session_path):
+        with open(session_path, encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if existing.get("state") == "recording" and _alive(existing.get("pid")):
+            emit({"ok": False, "error": f"Already recording in {take}", "pid": existing.get("pid")})
+    for name in (RAW, EVENTS, EDIT, "out.mp4", "preview.mp4", "timeline.json", INBOX, SESSION, LOG):
+        path = os.path.join(take, name)
+        if os.path.exists(path):
+            os.remove(path)
+    frames = os.path.join(take, "frames")
+    if os.path.isdir(frames):
+        for name in os.listdir(frames):
+            os.remove(os.path.join(frames, name))
+    executable = os.path.abspath(__file__)
+    log_path = os.path.join(take, LOG)
+    child_args = [sys.executable, executable, "record", "run", "--take", take]
+    if "--crop" in args:
+        child_args.extend(["--crop", flag(args, "--crop")])
+    if "--fps" in args:
+        child_args.extend(["--fps", flag(args, "--fps")])
+    log = open(log_path, "w", encoding="utf-8")
+    process = subprocess.Popen(child_args, stdout=log, stderr=log, start_new_session=True)
+    deadline = time.time() + 15
+    session = None
+    while time.time() < deadline:
+        if os.path.exists(session_path):
+            with open(session_path, encoding="utf-8") as handle:
+                session = json.load(handle)
+            if session.get("state") in ("recording", "failed"):
+                break
+        if process.poll() is not None:
+            break
+        time.sleep(0.05)
+    if not session or session.get("state") != "recording":
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGTERM)
+        reason = (session or {}).get("error") or _tail(log_path)
+        emit({"ok": False, "error": reason or "Recording did not start.", "log": log_path})
+    emit({
+        "ok": True,
+        "state": "recording",
+        "pid": process.pid,
+        "take": take,
+        "raw": os.path.join(take, RAW),
+        "events": os.path.join(take, EVENTS),
+        "edit": os.path.join(take, EDIT),
+        "width": session.get("width", 0),
+        "height": session.get("height", 0),
+    })
+
+
+def record_run(args):
+    take = take_path(args)
+    os.makedirs(take, exist_ok=True)
+    display, width, height = display_size()
+    offset_x, offset_y = 0, 0
+    crop = flag(args, "--crop")
+    if crop:
+        parts = [int(float(part)) for part in crop.split(",")]
+        if len(parts) != 4:
+            _fail(take, "--crop needs x,y,w,h")
+        offset_x, offset_y, width, height = parts
+    fps = int(flag(args, "--fps", "30"))
+    raw = os.path.join(take, RAW)
+    events_path = os.path.join(take, EVENTS)
+    command = [
+        "ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0",
+        "-framerate", str(fps), "-video_size", f"{width}x{height}",
+        "-i", f"{display}+{offset_x},{offset_y}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        raw,
+    ]
+    started = time.monotonic()
+    try:
+        ffmpeg = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        _fail(take, str(error))
+        return
+    xinput = subprocess.Popen(
+        ["xinput", "test-xi2", "--root"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    write_json(os.path.join(take, SESSION), {
+        "pid": os.getpid(),
+        "state": "recording",
+        "take": take,
+        "raw": raw,
+        "events": events_path,
+        "width": width,
+        "height": height,
+        "platform": "linux",
+    })
+    stop = {"value": False}
+
+    def request_stop(signum, frame):
+        stop["value"] = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    inbox_offset = 0
+    last_move = 0.0
+    pending_x = None
+    with open(events_path, "w", encoding="utf-8") as events:
+        events.write(json.dumps({
+            "t": 0, "type": "geometry", "x": 0, "y": 0, "w": width, "h": height,
+        }) + "\n")
+        events.flush()
+        while not stop["value"]:
+            _drain_inbox(take, events, started, inbox_offset)
+            inbox_offset = _inbox_size(take)
+            if xinput.stdout is None or not select.select([xinput.stdout], [], [], 0.05)[0]:
+                continue
+            line = xinput.stdout.readline()
+            if not line:
+                continue
+            now = time.monotonic() - started
+            if line.startswith("EVENT type") and "Motion" in line and "Raw" not in line:
+                pending_x = "motion"
+            elif line.startswith("EVENT type") and "ButtonPress" in line:
+                pending_x = "down"
+            elif line.startswith("EVENT type") and "ButtonRelease" in line:
+                pending_x = "up"
+            elif line.startswith("EVENT type") and "KeyPress" in line:
+                events.write(json.dumps({"t": round(now, 3), "type": "key"}) + "\n")
+                events.flush()
+                pending_x = None
+            elif "root:" in line and pending_x:
+                point = line.split("root:", 1)[1].strip().split()[0]
+                if "/" not in point:
+                    continue
+                x_text, y_text = point.split("/", 1)
+                x = float(x_text) - offset_x
+                y = float(y_text) - offset_y
+                if pending_x == "motion":
+                    if now - last_move < 1 / 60:
+                        pending_x = None
+                        continue
+                    last_move = now
+                    events.write(json.dumps({"t": round(now, 3), "type": "move", "x": round(x, 1), "y": round(y, 1)}) + "\n")
+                else:
+                    button = "left"
+                    events.write(json.dumps({
+                        "t": round(now, 3), "type": pending_x, "x": round(x, 1), "y": round(y, 1), "button": button,
+                    }) + "\n")
+                events.flush()
+                pending_x = None
+        xinput.terminate()
+        ffmpeg.send_signal(signal.SIGINT)
+        try:
+            ffmpeg.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            ffmpeg.kill()
+    duration = time.monotonic() - started
+    write_json(os.path.join(take, SESSION), {
+        "pid": os.getpid(),
+        "state": "done",
+        "take": take,
+        "raw": raw,
+        "events": events_path,
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "platform": "linux",
+    })
+
+
+def record_stop(args):
+    take = take_path(args)
+    session_path = os.path.join(take, SESSION)
+    if not os.path.exists(session_path):
+        emit({"ok": False, "error": f"No recording found in {take}"})
+    with open(session_path, encoding="utf-8") as handle:
+        session = json.load(handle)
+    pid = session.get("pid")
+    if pid and _alive(pid):
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 15
+        while time.time() < deadline and _alive(pid):
+            time.sleep(0.05)
+        if _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    edit_path = os.path.join(take, EDIT)
+    if not os.path.exists(edit_path):
+        write_json(edit_path, {
+            "version": 1,
+            "source": RAW,
+            "events": EVENTS,
+            "canvas": {"width": 1920, "height": 1080, "fps": 30},
+            "style": {
+                "background": "#14141C",
+                "padding": 72,
+                "radius": 20,
+                "shadow": 48,
+                "cursorScale": 1.6,
+                "zoomScale": 1.45,
+                "zoomIn": 0.35,
+                "zoomHold": 0.6,
+                "zoomOut": 0.4,
+            },
+            "blurs": [],
+            "covers": [],
+            "segments": [],
+            "cuts": [],
+            "steps": [],
+            "zooms": "auto",
+            "sourceSize": {"width": session.get("width", 0), "height": session.get("height", 0)},
+        })
+    emit({
+        "ok": True,
+        "state": "stopped",
+        "take": take,
+        "raw": os.path.join(take, RAW),
+        "events": os.path.join(take, EVENTS),
+        "edit": edit_path,
+        "duration": session.get("duration", 0),
+        "sourceSize": {"width": session.get("width", 0), "height": session.get("height", 0)},
+        "message": "Copy this take to the Mac and run screenreel plan, then screenreel beautify.",
+    })
+
+
+def mark(args):
+    take = take_path(args)
+    label = flag(args, "--label")
+    if not label:
+        emit({"ok": False, "error": "--label needs the step name"})
+    line = json.dumps({"t": 0, "type": "marker", "label": label}) + "\n"
+    with open(os.path.join(take, INBOX), "a", encoding="utf-8") as handle:
+        handle.write(line)
+    emit({"ok": True, "take": take, "label": label, "queued": True})
+
+
+def _drain_inbox(take, events, started, offset):
+    path = os.path.join(take, INBOX)
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as handle:
+        handle.seek(offset)
+        for line in handle:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            label = payload.get("label")
+            if not label:
+                continue
+            events.write(json.dumps({
+                "t": round(time.monotonic() - started, 3),
+                "type": "marker",
+                "label": label,
+            }) + "\n")
+            events.flush()
+
+
+def _inbox_size(take):
+    path = os.path.join(take, INBOX)
+    if not os.path.exists(path):
+        return 0
+    return os.path.getsize(path)
+
+
+def _readline(process):
+    if process.poll() is not None or process.stdout is None:
+        return ""
+    return process.stdout.readline()
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    return True
+
+
+def _tail(path):
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        lines = handle.readlines()
+    return "".join(lines[-20:]).strip()
+
+
+def _fail(take, message):
+    write_json(os.path.join(take, SESSION), {"pid": os.getpid(), "state": "failed", "error": message})
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("help", "--help", "-h"):
+        emit({"ok": False, "error": "screenreel doctor | record start --take <dir> | mark --take <dir> --label <text> | record stop --take <dir>"})
+    command = args[0]
+    if command == "doctor":
+        doctor()
+    if command == "mark":
+        mark(args[1:])
+    if command == "record" and len(args) > 1:
+        if args[1] == "start":
+            record_start(args[2:])
+        if args[1] == "stop":
+            record_stop(args[2:])
+        if args[1] == "run":
+            record_run(args[2:])
+    emit({"ok": False, "error": "Unknown command. On Linux this tool records. Beautify the take on the Mac."})
+
+
+if __name__ == "__main__":
+    main()
