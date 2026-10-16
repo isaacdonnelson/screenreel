@@ -17,7 +17,7 @@ Follow the `screenreel` skill. Record on the computer that can click the product
 
 Ask for the product URL, the click path, and a background hex before you record. The default background is `#14141C`. For a TestFiesta lesson use `#1E1B4B` and corner radius 16. Mark each step while you record.
 
-Use the shell to run `screenreel`. Read `edit.json`, the warnings, and the stills. Change the edit list and render again when a zoom, a blur, or a wait is wrong.
+Use the screenreel MCP tools when they are connected: `doctor`, `record_start`, `mark`, `record_stop`, and, on the Mac, `plan`, `beautify`, `frames`, and `timeline`. Otherwise use the shell to run `screenreel` on the Mac or `python3 linux/screenreel` on Linux. Read `edit.json`, the warnings, and the stills. Change the edit list and render again when a zoom, a blur, or a wait is wrong.
 
 Return the path to `out.mp4` and the step timeline.
 

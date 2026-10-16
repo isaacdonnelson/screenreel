@@ -375,11 +375,24 @@ def _fail(take, message):
     raise SystemExit(1)
 
 
+def _serve(argv):
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, here)
+    import serve
+    serve.main(argv)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("help", "--help", "-h"):
-        emit({"ok": False, "error": "screenreel doctor | record start --take <dir> | mark --take <dir> --label <text> | record stop --take <dir>"})
+        emit({
+            "ok": False,
+            "error": "screenreel doctor | record start --take <dir> | mark --take <dir> --label <text> | record stop --take <dir> | serve [--http host:port]",
+        })
     command = args[0]
+    if command == "serve":
+        _serve(args[1:])
+        return
     if command == "doctor":
         doctor()
     if command == "mark":

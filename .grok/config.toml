@@ -1,0 +1,8 @@
+# Loaded when Grok Build (and a local Grok Bot shell) is started in this repo.
+# The server speaks MCP on stdin. It has to run on the Linux display being recorded.
+
+[mcp_servers.screenreel]
+command = "python3"
+args = ["linux/screenreel", "serve"]
+startup_timeout_sec = 30
+tool_timeout_sec = 6000
