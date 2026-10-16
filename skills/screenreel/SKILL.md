@@ -13,6 +13,8 @@ Record the screen, then render a demo from an edit list. The brand color, zooms,
 
 The clicking computer and the rendering computer can be different. The take folder is the same on both.
 
+On Linux, Grok can call the same recorder three ways. Prefer the MCP tools (`doctor`, `record_start`, `mark`, `record_stop`) when they are connected. Otherwise run `python3 linux/screenreel`. `python3 linux/screenreel serve` speaks MCP on stdin. `python3 linux/screenreel serve --http 127.0.0.1:8765` serves `/mcp` for a Grok connector or the xAI Responses API, and `/v1/tools` plus `/v1/call` for function calling. A public bind requires `SCREENREEL_TOKEN`. The server has to run on the display being recorded.
+
 - Linux, where the bot clicks: `/Users/isaacdonnelson/git/screenreel/linux/screenreel`
 - Mac, where the picture is rendered: `screenreel` on `PATH` (`~/.local/bin/screenreel`)
 

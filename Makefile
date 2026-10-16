@@ -1,6 +1,6 @@
 PREFIX ?= $(HOME)/.local
 
-.PHONY: build install test
+.PHONY: build install test test-linux
 
 build:
 	swift build -c release
@@ -11,3 +11,6 @@ install: build
 
 test:
 	swift run screenreel-check
+
+test-linux:
+	python3 linux/serve_check.py

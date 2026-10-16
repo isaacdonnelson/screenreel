@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "screenreel": {
+      "command": "python3",
+      "args": ["linux/screenreel", "serve"]
+    }
+  }
+}
