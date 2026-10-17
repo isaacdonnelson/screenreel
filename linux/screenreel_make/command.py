@@ -101,9 +101,11 @@ def cmd_make(args: list[str]) -> dict[str, Any]:
                 try:
                     events = run_lesson(page, lesson, scheduled["actions"], clock_origin, actions_path)
                 finally:
+                    # Stop the grab before Chrome closes, or the last frames are a black desktop
+                    # and the narration hold freezes on that empty picture.
+                    session = capture.stop()
+                    capture = None
                     context.close()
-            session = capture.stop()
-            capture = None
             session["state"] = "done"
             session["display"] = screen
             _write(os.path.join(take, "session.json"), session)

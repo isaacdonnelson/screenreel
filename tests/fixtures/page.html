@@ -4,14 +4,17 @@
   <meta charset="utf-8">
   <title>Fixture</title>
   <style>
+    html, body { height: 100%; }
     body {
       margin: 0;
+      min-height: 100%;
       font-family: sans-serif;
       background-color: #f8fafc;
-      background-image:
-        linear-gradient(#e2e8f0 1px, transparent 1px),
-        linear-gradient(90deg, #e2e8f0 1px, transparent 1px);
-      background-size: 24px 24px;
+      background-image: repeating-linear-gradient(
+        90deg,
+        #0f172a 0 18px,
+        #f8fafc 18px 36px
+      );
     }
     button {
       position: absolute;
