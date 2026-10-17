@@ -49,6 +49,7 @@ class StepSpec:
     actions: list[ActionSpec] = field(default_factory=list)
     keep_toasts: bool = False
     note: str | None = None
+    audio: str | None = None
 
 
 @dataclass
@@ -183,7 +184,8 @@ def lint_lesson(lesson: Lesson) -> None:
             if action.kind == "type" and not action.text:
                 raise LessonError("type needs text", step=step.id, code="type_missing")
             if action.kind not in {
-                "goto", "click", "type", "select", "scroll_into_view", "wait_for", "hold", "script",
+                "goto", "click", "type", "select", "scroll_into_view", "scroll", "hover",
+                "check", "wait_for", "hold", "script", "narrate", "shell",
             }:
                 raise LessonError(f"Unknown action {action.kind}", step=step.id, code="unknown_action")
             if index and action.kind == "click" and not action.spec:
@@ -214,6 +216,7 @@ def _parse(raw: dict[str, Any], path: str) -> Lesson:
                 actions=_parse_actions(entry.get("do") or []),
                 keep_toasts=bool(entry.get("keep_toasts")),
                 note=entry.get("note"),
+                audio=str(entry["audio"]) if entry.get("audio") else None,
             )
         )
     if not steps:
@@ -281,8 +284,8 @@ def _action_from(kind: str, value: Any) -> ActionSpec:
         return ActionSpec(kind="hold", seconds=float(value), spec={})
     if kind == "goto":
         return ActionSpec(kind="goto", text=str(value), spec={})
-    if kind == "script":
-        return ActionSpec(kind="script", text=str(value), spec={})
+    if kind in {"script", "shell", "narrate"}:
+        return ActionSpec(kind=kind, text=str(value) if not isinstance(value, dict) else str(value.get("name") or ""), spec=dict(value) if isinstance(value, dict) else {})
     if kind == "wait_for":
         spec = dict(value) if isinstance(value, dict) else {"text": value}
         return ActionSpec(kind="wait_for", wait_for=spec, spec=spec)

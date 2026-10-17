@@ -1,8 +1,8 @@
-# TestFiesta lesson 3-1. Selectors are placeholders until `screenreel inspect` confirms them.
+# TestFiesta lesson 3-1. Selectors were checked against the live app.
 # URL and credentials come from the environment. Do not put secrets in this file.
 lesson: "3-1"
 title: "Create a run and mark a result"
-output: takes/3-1/out.mp4
+output: takes/3-1-live/out.mp4
 
 app:
   base_url: ${TESTFIESTA_URL}
@@ -10,23 +10,23 @@ app:
   password: ${TESTFIESTA_PASSWORD}
   profile: testfiesta
   viewport: {width: 1440, height: 810, scale: 1.333}
-  allowed_origins: ["${TESTFIESTA_URL}"]
+  allowed_origins: ["https://app.testfiesta.com"]
   hide:
     - "#intercom-container"
     - ".intercom-lightweight-app"
   mask:
-    - {selector: "[data-testid=workspace-switcher]", mode: replace, text: "Shopfront Team"}
+    - {x: 1615, y: 36, width: 275, height: 76, radius: 18}
   never_show: ["@gmail.com", "isaac"]
 
 style:
   background: "#1E1B4B"
+  padding: 64
   radius: 16
   accent: "#4F46E5"
-  cursor_scale: 1.0
+  cursor_scale: 1.6
   max_zoom: 1.6
   motion_blur: cursor
   captions: burn
-  step_chip: true
   title_card: {seconds: 3.0}
   end_card: {seconds: 3.0, line: "Next lesson in TestFiesta Academy"}
 
@@ -38,63 +38,56 @@ voice:
 
 audio:
   music: ""
-  duck_db: -12
-  sfx: {click: default, keys: default, whoosh: off}
+  duck_db: -14
+  sfx: {click: default, keys: default}
   lufs: -14
   true_peak: -1.0
 
-setup:
-  - goto: "/projects/SHOP/test-runs"
-  - script: archive_runs_named
-    args: {prefix: "Cart checkout smoke"}
-
 intro:
-  say: "Let's create a test run and record a result. A run is one pass through the cases you pick, so the team has one place to see what was tested and how it went."
+  say: "Let's create a test run and record a result. A run is one pass through the cases you pick. It gives the team one place to see what was tested, and how it went."
 
 steps:
   - id: create
     label: "Create a test run"
-    say: "Open Test runs and click Create test run. Results live inside a run, not in the case itself, so the same case can be run again and again."
+    say: "Open Test runs and click Create test run. Results live inside a run, not in the case itself. That way the same case can be run again and again, and every result is kept on its own."
     do:
-      - goto: "/projects/SHOP/test-runs"
+      - goto: "/runs"
       - click: {role: button, name: "Create test run"}
-        at: "Create"
-        result: {text: "Create test run", role: heading}
+        at: "click"
+        wait_for: {role: textbox, name: "Test run name"}
+        result: {role: heading, name: "Create test run"}
 
   - id: name
     label: "Name the run"
-    say: "Name it Cart checkout smoke, October 16. A clear name tells everyone exactly which pass they're reading later."
+    say: "Name it Shopfront smoke. A clear name tells everyone what this run covers. Later, when you look back at results, you'll know exactly which pass you're reading."
     do:
-      - click: {role: textbox, name: "Name"}
+      - click: {role: textbox, name: "Test run name"}
         at: "Name"
-      - type: "Cart checkout smoke - Oct 16"
-        at: "Cart"
-        expect_value: "Cart checkout smoke - Oct 16"
+      - type: "Cart checkout smoke - Oct 16 v2"
+        at: "clear"
+        expect_value: "Cart checkout smoke - Oct 16 v2"
 
   - id: start-date
     label: "Start date"
-    say: "Pick a Start Date. The name and both dates are required, which ties every run to a real window of time."
+    say: "Pick a Start Date with the date picker. The name and both dates are required, so Next stays off until they're set. That ties every run to a real window of time."
     do:
-      - click: {label: "Start Date"}
+      - click: {selector: "input[placeholder='MM/DD/YY'] >> nth=0"}
         at: "Start"
-        result: {role: dialog}
-      - click: {role: gridcell, name: "16", within: {role: dialog}}
+      - click: {role: button, name: "16"}
         at: "required"
 
   - id: due-date
     label: "Due date"
-    say: "Then pick a Due Date. A run with a deadline lets the team see whether testing is on track for the release."
+    say: "Then pick a Due Date. A run with no deadline tends to drift. With one, the team can tell if testing is on track for the release."
     do:
-      - click: {label: "Due Date"}
+      - click: {selector: "input[placeholder='MM/DD/YY'] >> nth=1"}
         at: "Due"
-        result: {role: dialog}
-      - click: {role: gridcell, name: "23", within: {role: dialog}}
+      - click: {role: button, name: "23"}
         at: "deadline"
-    note: "Known display bug: the field may show 10/22/26 after picking the 23rd. Narration avoids reading the date aloud."
 
   - id: next
     label: "Next: choose cases"
-    say: "Click Next. This form only sets up the run. What you actually test comes on the next screen."
+    say: "Scroll down and click Next. This form only sets up the run. What you actually test comes on the next screen."
     do:
       - scroll_into_view: {role: button, name: "Next"}
       - click: {role: button, name: "Next"}
@@ -103,41 +96,40 @@ steps:
 
   - id: tick
     label: "Tick the case"
-    say: "Tick only the case you need, here SHOP 1520, guest can add an item to the cart. A focused run shows clearly whether this change works."
+    say: "Tick only the cases you need, here the cart case. Every extra case is time spent. A focused run shows clearly whether this change works."
     do:
-      - click: {role: checkbox, within: {role: row, has_text: "SHOP-1520"}}
-        at: "Tick"
-        result: {role: row, has_text: "SHOP-1520"}
+      - click: {selector: "tr:has-text('SHOP-1520') input[type=checkbox] >> xpath=.. >> nth=0"}
+        at: "cart"
+        result: {selector: "tr:has-text('SHOP-1520')"}
 
   - id: save
     label: "Save the run"
-    say: "Click Save, and the run shows up in the list. Each case you add gets its own id inside the run, so its result is tracked here without changing the original case."
+    say: "Click Save, and the run shows up in the list. Each case you add gets its own id inside the run. So its result is tracked here, without changing the original case."
     keep_toasts: true
     do:
       - click: {role: button, name: "Save"}
         at: "Save"
-        wait_for: {text: "Cart checkout smoke - Oct 16"}
-        result: {role: row, has_text: "Cart checkout smoke - Oct 16"}
+        wait_for: {text: "Cart checkout smoke - Oct 16 v2"}
+        result: {selector: "tr:has-text('Cart checkout smoke - Oct 16 v2')"}
 
   - id: open
     label: "Open the run and the case"
-    say: "Open the run, then click the case. This is where you record what the screen actually did."
+    say: "Open the run, then click the case. This is where you record what the screen actually did. Run the steps for real first, so the result reflects the product, not the case text."
     do:
-      - click: {role: link, name: "Cart checkout smoke - Oct 16"}
+      - click: {selector: "text='Cart checkout smoke - Oct 16 v2' >> nth=0"}
         at: "run"
         wait_for: {text: "Guest can add an item to the cart"}
-      - click: {text: "Guest can add an item to the cart"}
+      - click: {selector: "td:has-text('Guest can add an item to the cart') >> nth=0"}
         at: "case"
-        result: {role: complementary}
+        wait_for: {role: heading, name: "Guest can add an item to the cart"}
 
   - id: passed
     label: "Mark Passed"
-    say: "Set the status to Passed only when you ran the steps and the screen matched. A fake pass hides a bug that customers then find, and the run's progress updates right away."
+    say: "Mark Passed only when you ran it and the screen matched. A fake pass hides a bug that customers then find. Reports and release decisions rest on these results, and the run's progress updates right away."
     do:
-      - click: {role: button, name: "Active"}
-        at: "status"
-        result: {role: listbox}
-      - click: {role: option, name: "Passed"}
-        at: "Passed"
+      - click: {selector: "xpath=//h2[normalize-space()='Guest can add an item to the cart']/preceding::*[@role='combobox'][1]"}
+        at: "Mark"
+      - click: {selector: "li:has-text('Passed') >> visible=true >> nth=0"}
+        at: "matched"
         result: {text: "100%"}
       - hold: 1.0

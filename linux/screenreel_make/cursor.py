@@ -116,6 +116,30 @@ def plan_travel(start: Point, end: Point, press: float, index: int, release: flo
     )
 
 
+def cursor_opacity(travels: list[Travel], t: float) -> float:
+    """Fade out 0.3 s after 2 s idle, and fade in across the 0.25 s before the next move."""
+    if not travels:
+        return 1.0
+    if t < travels[0].t0:
+        lead = travels[0].t0 - 0.25
+        if t < lead:
+            return 0.0
+        return clamp((t - lead) / 0.25, 0.0, 1.0)
+    for index, travel in enumerate(travels):
+        nxt = travels[index + 1] if index + 1 < len(travels) else None
+        end = nxt.t0 if nxt is not None else float("inf")
+        if not (travel.t0 <= t < end):
+            continue
+        show = nxt.t0 - 0.25 if nxt is not None else None
+        if show is not None and t >= show:
+            return clamp((t - show) / 0.25, 0.0, 1.0)
+        idle_at = travel.release + 2.0
+        if t < idle_at:
+            return 1.0
+        return clamp(1.0 - (t - idle_at) / 0.3, 0.0, 1.0)
+    return 1.0
+
+
 def sample_cursor(travels: list[Travel], t: float, idle: Point) -> tuple[Point, float]:
     if not travels:
         return idle, 1.0

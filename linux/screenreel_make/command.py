@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from typing import Any
 
 import cv2
+import numpy as np
 
 from screenreel_make.camera import (
     Box,
@@ -63,13 +65,6 @@ def cmd_make(args: list[str]) -> dict[str, Any]:
             "message": "Word timings are estimated. Set ELEVENLABS_API_KEY for real speech.",
             "fix": "Export ELEVENLABS_API_KEY and rerun without --allow-estimated-voice",
         })
-    warnings.append({
-        "code": "not_implemented",
-        "step": None,
-        "t": 0,
-        "message": "Audio mix, captions, and privacy OCR are not in this milestone",
-        "fix": None,
-    })
     auto_payload = _auto_payload(lesson, scheduled)
     plan = write_layers(take, auto_payload)
     with open(os.path.join(take, "schedule.json"), "w", encoding="utf-8") as handle:
@@ -122,33 +117,38 @@ def cmd_make(args: list[str]) -> dict[str, Any]:
             display.stop()
     capture_s = time.monotonic() - capture_started
     render_started = time.monotonic()
-    timeline = _timeline(lesson, scheduled, events, raw_path, preview)
+    timeline = _timeline(lesson, scheduled, events, raw_path, preview, voice["tracks"])
     serializable = {key: value for key, value in timeline.items() if key not in {"camera", "travel_objects"}}
     _write(os.path.join(take, "timeline.json"), serializable)
-    video_path = os.path.join(take, "preview.mp4" if preview else "out.mp4")
+    video_path = os.path.join(take, "steps", f"{only}.mp4") if only else os.path.join(take, "preview.mp4" if preview else "out.mp4")
     if timeline["camera"]:
-        movie = _render(raw_path, timeline, video_path, lesson, preview)
+        movie = _render(raw_path, timeline, video_path, lesson, preview, scheduled)
     else:
         movie = None
+    if movie:
+        movie = _mix_and_caption(take, lesson, scheduled, timeline, video_path, movie, voice)
     render_s = time.monotonic() - render_started
     qa_started = time.monotonic()
-    qa = _qa(timeline, movie, video_path if movie else None)
+    qa = _qa(timeline, movie, video_path if movie else None, lesson)
     qa_s = time.monotonic() - qa_started
     ok = bool(qa["failed"] == 0 and timeline["retime"].get("ok", True))
     return {
         "ok": ok,
         "take": take,
         "outputs": {
-            "video": video_path if movie else None,
+            "video": None if preview or not movie else video_path,
             "preview": video_path if preview and movie else None,
-            "captions_srt": None,
+            "step": video_path if only and movie else None,
+            "captions_srt": (movie or {}).get("srt"),
+            "captions_vtt": (movie or {}).get("vtt"),
             "timeline": os.path.join(take, "timeline.json"),
-            "contact_sheet": None,
-            "stills": [],
+            "contact_sheet": (movie or {}).get("contact"),
+            "stills": (movie or {}).get("stills") or [],
         },
         "duration": timeline["duration"],
+        "fps": timeline["fps"],
         "steps": timeline["steps"],
-        "audio": None,
+        "audio": (movie or {}).get("audio"),
         "qa": qa,
         "warnings": warnings + timeline["retime"].get("warnings", []),
         "timings_s": {
@@ -161,8 +161,9 @@ def cmd_make(args: list[str]) -> dict[str, Any]:
     }
 
 
-def _timeline(lesson: Lesson, scheduled: dict[str, Any], events: list[dict[str, Any]], raw_path: str, preview: bool) -> dict[str, Any]:
+def _timeline(lesson: Lesson, scheduled: dict[str, Any], events: list[dict[str, Any]], raw_path: str, preview: bool, tracks: dict[str, Any]) -> dict[str, Any]:
     presses = [event for event in events if event.get("type") == "press"]
+    pointed = [event for event in events if event.get("type") in {"press", "hover", "type"}]
     actuals = [{"id": event.get("id"), "capture": float(event["t"])} for event in presses if event.get("id")]
     duration = _media_duration(raw_path) if os.path.exists(raw_path) else float(scheduled["duration"])
     retimed = retime(scheduled, actuals, duration)
@@ -174,9 +175,9 @@ def _timeline(lesson: Lesson, scheduled: dict[str, Any], events: list[dict[str, 
     index = 0
     placed = {item["id"]: item for item in retimed["presses"]}
     for planned in scheduled["actions"]:
-        if planned["kind"] not in {"click", "select", "type"}:
+        if planned["kind"] not in {"click", "select", "type", "hover"}:
             continue
-        event = next((item for item in presses if item.get("id") == planned["id"]), None)
+        event = next((item for item in pointed if item.get("id") == planned["id"]), None)
         if event is None:
             continue
         end = Point(float(event["x"]), float(event["y"]))
@@ -228,31 +229,218 @@ def _timeline(lesson: Lesson, scheduled: dict[str, Any], events: list[dict[str, 
         "camera_samples": len(camera),
         "camera": camera,
         "travel_objects": travels,
+        "mask_events": [event for event in events if event.get("type") == "mask"],
+        "cues": _cues(scheduled, tracks),
+        "key_times": _key_times(events, placed),
         "shots": [{"id": shot.id, "t": shot.t, "cx": shot.cx, "cy": shot.cy, "scale": shot.scale} for shot in shots],
     }
 
 
-def _render(raw_path: str, timeline: dict[str, Any], video_path: str, lesson: Lesson, preview: bool) -> dict[str, Any]:
+def _cues(scheduled: dict[str, Any], tracks: dict[str, Any]) -> list[dict[str, Any]]:
+    from screenreel_make.captions import wrap_cues
+
+    cues = []
+    for step in scheduled.get("steps") or []:
+        words = tracks.get(step["id"]) or []
+        if not words:
+            continue
+        origin = float(step.get("audio_start") or step.get("t0") or 0)
+        base = float(words[0]["start"])
+        shifted = [
+            {"word": word["word"], "start": origin + float(word["start"]) - base, "end": origin + float(word["end"]) - base}
+            for word in words
+        ]
+        cues.extend(wrap_cues(shifted))
+    return cues
+
+
+def _key_times(events: list[dict[str, Any]], placed: dict[str, Any]) -> list[float]:
+    times = []
+    for event in events:
+        if event.get("type") != "type":
+            continue
+        start = float(placed.get(event.get("id"), {}).get("output", event.get("t") or 0))
+        for index in range(int(event.get("keys") or 0)):
+            times.append(round(start + index * 0.07, 3))
+    return times
+
+
+def _mask_boxes(events: list[dict[str, Any]], source_t: float) -> list[dict[str, Any]]:
+    previous = None
+    nxt = None
+    for event in events:
+        if float(event.get("t") or 0) <= source_t:
+            previous = event
+        elif nxt is None:
+            nxt = event
+            break
+    if previous is None:
+        return list(nxt["boxes"]) if nxt else []
+    if nxt is None:
+        return list(previous["boxes"])
+    span = float(nxt["t"]) - float(previous["t"])
+    if span <= 1e-3 or len(previous["boxes"]) != len(nxt["boxes"]):
+        return list(previous["boxes"])
+    mix = (source_t - float(previous["t"])) / span
+    blended = []
+    for left, right in zip(previous["boxes"], nxt["boxes"]):
+        blended.append({
+            "x": left["x"] + (right["x"] - left["x"]) * mix,
+            "y": left["y"] + (right["y"] - left["y"]) * mix,
+            "width": left["width"] + (right["width"] - left["width"]) * mix,
+            "height": left["height"] + (right["height"] - left["height"]) * mix,
+            "radius": left.get("radius") or 18,
+        })
+    return blended
+
+
+def _mix_and_caption(take: str, lesson: Lesson, scheduled: dict[str, Any], timeline: dict[str, Any], video_path: str, movie: dict[str, Any], voice: dict[str, Any]) -> dict[str, Any]:
+    from screenreel_make.audio import loudnorm, mix, tone_for_words, write_wav
+    from screenreel_make.captions import validate_cues, write_srt, write_vtt
+    from screenreel_make.voice import write_audio_files
+
+    voice_dir = os.path.join(take, "voice")
+    write_audio_files(voice.get("audio") or {}, voice_dir)
+    files = dict(voice.get("files") or {})
+    cues_in = []
+    for step in scheduled.get("steps") or []:
+        ident = step["id"]
+        path = files.get(ident) or os.path.join(voice_dir, f"{ident}.mp3")
+        if not os.path.exists(path):
+            words = (voice.get("tracks") or {}).get(ident) or []
+            path = os.path.join(voice_dir, f"{ident}.wav")
+            write_wav(path, tone_for_words(words))
+        cues_in.append((path, float(step.get("audio_start") or step.get("t0") or 0)))
+    mix_wav = os.path.join(take, "mix.wav")
+    mix(
+        cues_in,
+        [float(item["output"]) for item in timeline["presses"]],
+        [float(item) for item in timeline.get("key_times") or []],
+        float(timeline["duration"]),
+        mix_wav,
+        music_path=str((lesson.audio or {}).get("music") or ""),
+        duck_db=abs(float((lesson.audio or {}).get("duck_db") or 14)),
+    )
+    muxed = video_path + ".mux.mp4"
+    report = loudnorm(
+        mix_wav,
+        video_path,
+        muxed,
+        lufs=float((lesson.audio or {}).get("lufs") or -14),
+        true_peak=float((lesson.audio or {}).get("true_peak") or -1),
+    )
+    os.replace(muxed, video_path)
+    cues = timeline.get("cues") or []
+    srt = os.path.join(take, "captions.srt")
+    vtt = os.path.join(take, "captions.vtt")
+    write_srt(cues, srt)
+    write_vtt(cues, vtt)
+    problems = validate_cues(cues)
+    contact, stills = _contact_sheet(video_path, take, timeline)
+    movie["audio"] = {"lufs": report.get("lufs"), "true_peak": report.get("true_peak"), "path": video_path}
+    movie["srt"] = srt
+    movie["vtt"] = vtt
+    movie["caption_problems"] = problems
+    movie["contact"] = contact
+    movie["stills"] = stills
+    return movie
+
+
+def _contact_sheet(video_path: str, take: str, timeline: dict[str, Any]) -> tuple[str | None, list[str]]:
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        return None, []
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30
+    count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = count / fps if fps else 0
+    stamps = list(range(0, int(duration) + 1, 5))
+    for step in timeline.get("steps") or []:
+        stamps.append(float(step.get("t0") or 0))
+    import numpy as np
+
+    stills = []
+    tiles = []
+    folder = os.path.join(take, "stills")
+    os.makedirs(folder, exist_ok=True)
+    for stamp in sorted(set(round(item, 2) for item in stamps)):
+        capture.set(cv2.CAP_PROP_POS_MSEC, stamp * 1000)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            continue
+        small = cv2.resize(frame, (320, 180))
+        path = os.path.join(folder, f"{stamp:.2f}.jpg")
+        cv2.imwrite(path, small)
+        stills.append(path)
+        tiles.append(small)
+    capture.release()
+    if not tiles:
+        return None, stills
+    columns = 4
+    rows = (len(tiles) + columns - 1) // columns
+    sheet = np.zeros((rows * 180, columns * 320, 3), np.uint8)
+    for index, tile in enumerate(tiles):
+        y, x = divmod(index, columns)
+        sheet[y * 180: (y + 1) * 180, x * 320: (x + 1) * 320] = tile
+    contact = os.path.join(take, "contact.jpg")
+    cv2.imwrite(contact, sheet)
+    return contact, stills
+
+
+def _render(raw_path: str, timeline: dict[str, Any], video_path: str, lesson: Lesson, preview: bool, scheduled: dict[str, Any]) -> dict[str, Any]:
+    from screenreel_make.blur import apply_blurs
+    from screenreel_make.captions import caption_text
+
     capture = cv2.VideoCapture(raw_path)
     fps = capture.get(cv2.CAP_PROP_FPS) or 60
-    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1
+    frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
+    state = {"index": -1, "frame": None}
+    static = [item for item in (lesson.app.get("mask") or []) if isinstance(item, dict) and "x" in item]
+    mask_events = [event for event in timeline.get("mask_events") or [] if event.get("boxes")]
+    cues = timeline.get("cues") or []
 
     def source_at(output_t: float):
         source_t = source_time(timeline["retime"], output_t)
         index = int(max(0, min(frame_count - 1, round(source_t * fps))))
-        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, frame = capture.read()
-        if not ok or frame is None:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = capture.read()
-        if frame is None:
-            raise RuntimeError("Capture has no frames")
+        if index == state["index"] and state["frame"] is not None:
+            frame = state["frame"]
+        else:
+            ok, frame = False, None
+            if 0 < index - state["index"] <= 90:
+                while state["index"] < index:
+                    ok, frame = capture.read()
+                    state["index"] += 1
+                    if not ok:
+                        break
+            else:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = capture.read()
+                state["index"] = index
+            if not ok or frame is None:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = capture.read()
+                state["index"] = 0
+            if frame is None:
+                raise RuntimeError("Capture has no frames")
+            state["frame"] = frame
+        boxes = list(static) + _mask_boxes(mask_events, source_t)
+        if boxes:
+            return apply_blurs(frame, boxes)
         return frame
 
+    title_s = float(scheduled.get("title_card") or 0)
+    end_s = float(scheduled.get("end_card") or 0)
+    end_line = str((lesson.style.get("end_card") or {}).get("line") or lesson.title)
+    duration = float(timeline["duration"])
+
+    def title_at(t: float) -> str:
+        if title_s and t < title_s:
+            return lesson.title
+        if end_s and t > max(0.0, duration - end_s):
+            return end_line
+        return ""
+
+    burn = str(lesson.style.get("captions") or "off") == "burn"
     try:
-        blurs = list(lesson.app.get("mask") or [])
-        # Selector masks are tracked later. Static rects, if the lesson has them, blur now.
-        static = [item for item in blurs if "x" in item and "y" in item]
         return render_movie(
             source_at,
             (timeline["source_size"]["width"], timeline["source_size"]["height"]),
@@ -261,21 +449,31 @@ def _render(raw_path: str, timeline: dict[str, Any], video_path: str, lesson: Le
             timeline["presses"],
             video_path,
             background=lesson.background,
-            padding=float(lesson.style.get("padding") or 72),
+            padding=float(lesson.style.get("padding") or 64),
             radius=float(lesson.style.get("radius") or 16),
             preview=preview,
-            blurs=static,
+            blurs=None,
+            crf=18,
+            motion_blur=str(lesson.style.get("motion_blur") or "off"),
+            cursor_scale=float(lesson.style.get("cursor_scale") or 1.6),
+            caption_at=(lambda t: caption_text(cues, t)) if burn else None,
+            title_at=title_at if (title_s or end_s) else None,
+            step_bounds=[(float(step["t0"]), float(step["t1"])) for step in timeline["steps"]],
         )
     finally:
         capture.release()
 
 
-def _qa(timeline: dict[str, Any], movie: dict[str, Any] | None, video_path: str | None) -> dict[str, Any]:
+def _qa(timeline: dict[str, Any], movie: dict[str, Any] | None, video_path: str | None, lesson: Lesson | None = None) -> dict[str, Any]:
     checks = []
     checks.append(_check_cursor(timeline))
     checks.append(_check_sync(timeline))
     checks.append(_check_jumps(timeline))
     checks.append(_check_result(timeline))
+    checks.append(_check_frozen(video_path))
+    checks.append(_check_captions(movie))
+    checks.append(_check_loudness(movie))
+    checks.append(_check_ocr(video_path, lesson))
     if video_path and os.path.exists(video_path):
         info = probe(video_path)
         rate = str(info.get("avg_frame_rate") or "")
@@ -323,8 +521,8 @@ def _check_cursor(timeline: dict[str, Any]) -> dict[str, Any]:
 def _check_sync(timeline: dict[str, Any]) -> dict[str, Any]:
     slips = [abs(float(item.get("slip") or 0)) for item in timeline["retime"].get("presses") or []]
     if not slips:
-        return {"id": "sync_within_150ms", "ok": True, "max_slip_s": 0}
-    return {"id": "sync_within_150ms", "ok": max(slips) <= 0.15, "max_slip_s": round(max(slips), 3)}
+        return {"id": "sync_within_80ms", "ok": True, "max_slip_s": 0}
+    return {"id": "sync_within_80ms", "ok": max(slips) <= 0.08, "max_slip_s": round(max(slips), 3)}
 
 
 def _check_jumps(timeline: dict[str, Any]) -> dict[str, Any]:
@@ -361,6 +559,78 @@ def _check_result(timeline: dict[str, Any]) -> dict[str, Any]:
         if not crop.contains(result):
             missed += 1
     return {"id": "result_in_frame", "ok": missed == 0, "checked": checked}
+
+
+def _check_frozen(video_path: str | None) -> dict[str, Any]:
+    if not video_path or not os.path.exists(video_path):
+        return {"id": "no_static_over_1_5s", "ok": True, "note": "no video"}
+    capture = cv2.VideoCapture(video_path)
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30
+    step = max(1, int(round(fps * 0.5)))
+    previous = None
+    run = 0.0
+    worst = 0.0
+    index = 0
+    while True:
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            break
+        if index % step == 0:
+            small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
+            if previous is not None:
+                delta = float(np.mean(cv2.absdiff(small, previous)))
+                if delta < 0.8:
+                    run += 0.5
+                    worst = max(worst, run)
+                else:
+                    run = 0.0
+            previous = small
+        index += 1
+    capture.release()
+    return {"id": "no_static_over_1_5s", "ok": worst <= 1.5, "longest_s": round(worst, 2)}
+
+
+def _check_captions(movie: dict[str, Any] | None) -> dict[str, Any]:
+    if not movie:
+        return {"id": "captions", "ok": True, "note": "no movie"}
+    problems = movie.get("caption_problems") or []
+    srt = movie.get("srt")
+    return {"id": "captions", "ok": not problems and bool(srt and os.path.exists(srt)), "problems": problems}
+
+
+def _check_loudness(movie: dict[str, Any] | None) -> dict[str, Any]:
+    audio = (movie or {}).get("audio") or {}
+    lufs = audio.get("lufs")
+    peak = audio.get("true_peak")
+    if lufs is None or peak is None:
+        return {"id": "loudness", "ok": False, "lufs": lufs, "true_peak": peak}
+    return {"id": "loudness", "ok": abs(float(lufs) + 14) <= 0.5 and float(peak) <= -1.0, "lufs": lufs, "true_peak": peak}
+
+
+def _check_ocr(video_path: str | None, lesson: Lesson | None) -> dict[str, Any]:
+    needles = [str(item).lower() for item in ((lesson.app.get("never_show") if lesson else None) or []) if str(item).strip()]
+    if not video_path or not needles or not os.path.exists(video_path):
+        return {"id": "privacy_ocr", "ok": True, "hits": 0}
+    capture = cv2.VideoCapture(video_path)
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30
+    step = max(1, int(round(fps * 2)))
+    hits = []
+    index = 0
+    while True:
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            break
+        if index % step == 0:
+            path = f"/tmp/screenreel-ocr-{index}.png"
+            cv2.imwrite(path, cv2.resize(frame, (960, 540)))
+            result = subprocess.run(["tesseract", path, "stdout", "--psm", "6"], capture_output=True, text=True)
+            text = (result.stdout or "").lower()
+            for needle in needles:
+                if needle in text:
+                    hits.append(needle)
+        index += 1
+    capture.release()
+    return {"id": "privacy_ocr", "ok": not hits, "hits": hits}
 
 
 def _nearest_camera(samples: list, t: float):
@@ -467,11 +737,21 @@ def _video_size(path: str) -> tuple[int, int] | None:
 
 
 def cmd_inspect(args: list[str]) -> dict[str, Any]:
-    from screenreel_make.driver import inspect_lesson
+    from screenreel_make.driver import inspect_lesson, inspect_url
 
     flags, positional = _flags(args)
     if not positional:
-        raise LessonError("screenreel inspect <lesson.yaml>")
+        raise LessonError("screenreel inspect <lesson.yaml or URL>")
+    target = positional[0]
+    if target.startswith("http://") or target.startswith("https://"):
+        display_name = flags.get("--display")
+        display = None if display_name else start_xvfb(":91")
+        screen = display_name or display.name
+        try:
+            return inspect_url(target, screen)
+        finally:
+            if display:
+                display.stop()
     lesson = load_lesson(positional[0])
     display_name = flags.get("--display")
     display = None if display_name else start_xvfb(":91")

@@ -20,7 +20,7 @@ setup:
 steps:
   - id: next
     label: Next
-    say: "Click Next."
+    say: "Click Next. The button sits in the middle of the page, and the click should land as the word Next starts."
     do:
       - click: {role: button, name: "Next"}
         at: "Next"
