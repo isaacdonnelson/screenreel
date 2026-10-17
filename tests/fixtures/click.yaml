@@ -1,0 +1,27 @@
+lesson: fixture
+title: Fixture click
+output: takes/fixture/out.mp4
+app:
+  base_url: ${FIXTURE_URL}
+  profile: fixture
+  viewport: {width: 1920, height: 1080, scale: 1}
+style:
+  background: "#1E1B4B"
+  radius: 16
+  accent: "#4F46E5"
+  max_zoom: 1.6
+  captions: off
+  title_card: {seconds: 0}
+  end_card: {seconds: 0}
+voice:
+  provider: estimated
+setup:
+  - goto: "/page.html"
+steps:
+  - id: next
+    label: Next
+    say: "Click Next."
+    do:
+      - click: {role: button, name: "Next"}
+        at: "Next"
+        result: {role: button, name: "Next"}

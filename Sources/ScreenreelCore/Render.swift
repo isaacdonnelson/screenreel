@@ -55,6 +55,46 @@ func makeSolidImage(width: Int, height: Int, top: (CGFloat, CGFloat, CGFloat), b
     )!
 }
 
+func makeCheckerImage(width: Int, height: Int) -> CGImage {
+    var bytes = [UInt8](repeating: 255, count: width * height * 4)
+    for y in 0..<height {
+        for x in 0..<width {
+            let index = (y * width + x) * 4
+            if y < 50 && x < 100 {
+                if x % 2 == 0 {
+                    bytes[index] = 255
+                    bytes[index + 1] = 0
+                    bytes[index + 2] = 0
+                } else {
+                    bytes[index] = 0
+                    bytes[index + 1] = 255
+                    bytes[index + 2] = 0
+                }
+            } else if y >= height - 50 && x < 100 {
+                bytes[index] = 0
+                bytes[index + 1] = 0
+                bytes[index + 2] = 255
+            }
+            bytes[index + 3] = 255
+        }
+    }
+    let data = Data(bytes) as CFData
+    let provider = CGDataProvider(data: data)!
+    return CGImage(
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bitsPerPixel: 32,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: provider,
+        decode: nil,
+        shouldInterpolate: false,
+        intent: .defaultIntent
+    )!
+}
+
 func pixel(of image: CGImage, x: Int, y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
     let width = image.width
     let height = image.height
@@ -106,6 +146,7 @@ func renderFrame(
     ctx.scaleBy(x: 1, y: -1)
     ctx.interpolationQuality = .high
     ctx.setAllowsAntialiasing(true)
+    let source = applySourceBlurs(source, blurs: blurs, context: context)
 
     let color = try parseColor(style.background)
     ctx.setFillColor(CGColor(srgbRed: color.0, green: color.1, blue: color.2, alpha: 1))
@@ -138,11 +179,10 @@ func renderFrame(
     ctx.addPath(window)
     ctx.clip()
     drawImage(source, crop: layout.crop, dest: layout.dest, in: ctx)
-    drawBlurs(blurs, source: source, crop: layout.crop, dest: layout.dest, in: ctx, context: context)
     drawCovers(covers, source: source, crop: layout.crop, dest: layout.dest, in: ctx)
-    for ripple in ripples where ripple.age >= 0 && ripple.age <= 0.42 {
+    for ripple in ripples where ripple.age >= 0 && ripple.age <= 0.45 {
         let point = mapSourcePoint(CGPoint(x: ripple.x, y: ripple.y), crop: layout.crop, dest: layout.dest)
-        let grow = CGFloat(min(1, ripple.age / 0.42))
+        let grow = CGFloat(min(1, ripple.age / 0.45))
         let ring = 8 + 64 * grow
         ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: (1 - grow) * 0.75))
         ctx.setLineWidth(3)
@@ -191,11 +231,30 @@ private func drawImage(_ image: CGImage, crop: CGRect, dest: CGRect, in ctx: CGC
     ctx.draw(cropped, in: dest)
 }
 
-private func drawBlurs(_ blurs: [BlurRect], source: CGImage, crop: CGRect, dest: CGRect, in ctx: CGContext, context: CIContext) {
-    let sourceBounds = CGRect(x: 0, y: 0, width: source.width, height: source.height)
+/// Paint blurs into source pixels before the camera crop. Rects are top-left, y down.
+func applySourceBlurs(_ source: CGImage, blurs: [BlurRect], context: CIContext) -> CGImage {
+    if blurs.isEmpty { return source }
+    let width = source.width
+    let height = source.height
+    var bytes = [UInt8](repeating: 0, count: width * height * 4)
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(
+        data: &bytes,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return source }
+    ctx.translateBy(x: 0, y: CGFloat(height))
+    ctx.scaleBy(x: 1, y: -1)
+    ctx.interpolationQuality = .high
+    ctx.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
     for blur in blurs {
         let rect = CGRect(x: blur.x, y: blur.y, width: blur.width, height: blur.height)
-        let visible = rect.intersection(crop).intersection(sourceBounds).integral
+        let visible = rect.intersection(bounds).integral
         guard visible.width >= 2, visible.height >= 2, let patch = source.cropping(to: visible) else { continue }
         let input = CIImage(cgImage: patch)
         let blurred = input
@@ -203,9 +262,9 @@ private func drawBlurs(_ blurs: [BlurRect], source: CGImage, crop: CGRect, dest:
             .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blur.radius])
             .cropped(to: input.extent)
         guard let output = context.createCGImage(blurred, from: blurred.extent) else { continue }
-        let mapped = mapSourceRect(visible, crop: crop, dest: dest)
-        ctx.draw(output, in: mapped)
+        ctx.draw(output, in: visible)
     }
+    return ctx.makeImage() ?? source
 }
 
 private func drawCovers(_ covers: [CoverRect], source: CGImage, crop: CGRect, dest: CGRect, in ctx: CGContext) {

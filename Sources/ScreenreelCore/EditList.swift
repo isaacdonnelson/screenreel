@@ -35,11 +35,29 @@ struct Zoom: Equatable {
     var y: Double
     var scale: Double
     var hold: Double
+    var id: String? = nil
+}
+
+struct ZoomTweak: Equatable {
+    var t: Double?
+    var x: Double?
+    var y: Double?
+    var scale: Double?
+    var hold: Double?
+}
+
+/// Manual shots are added on top of auto zooms. A list never turns auto off.
+struct CameraSpec: Equatable {
+    var auto: Bool = true
+    var add: [Zoom] = []
+    var remove: [String] = []
+    var tweak: [String: ZoomTweak] = [:]
 }
 
 enum Zooms: Equatable {
     case auto
     case explicit([Zoom])
+    case camera(CameraSpec)
 }
 
 struct Event: Equatable {
@@ -221,9 +239,20 @@ func autoZooms(events: [Event], style: Style) -> [Zoom] {
         return time - last.t < 0.2
     }
 
+    var clickCount = 0
+    var keyCount = 0
+
     func closeBurst() {
         guard let start = burstStart else { return }
-        zooms.append(Zoom(t: start, x: burstCursor.x, y: burstCursor.y, scale: style.zoomScale, hold: style.zoomHold))
+        keyCount += 1
+        zooms.append(Zoom(
+            t: start,
+            x: burstCursor.x,
+            y: burstCursor.y,
+            scale: style.zoomScale,
+            hold: style.zoomHold,
+            id: "auto-key-\(keyCount)"
+        ))
         burstStart = nil
         lastKey = nil
     }
@@ -241,7 +270,15 @@ func autoZooms(events: [Event], style: Style) -> [Zoom] {
             }
             cursor = CGPoint(x: event.x, y: event.y)
             if !recentlyZoomed(event.t) {
-                zooms.append(Zoom(t: event.t, x: event.x, y: event.y, scale: style.zoomScale, hold: style.zoomHold))
+                clickCount += 1
+                zooms.append(Zoom(
+                    t: event.t,
+                    x: event.x,
+                    y: event.y,
+                    scale: style.zoomScale,
+                    hold: style.zoomHold,
+                    id: "auto-click-\(clickCount)"
+                ))
             }
         case "key", "scroll":
             if let previous = lastKey, burstStart != nil, event.t - previous <= 0.4 {
@@ -266,20 +303,121 @@ func autoZooms(events: [Event], style: Style) -> [Zoom] {
 }
 
 func resolvedZooms(edit: EditList, events: [Event]) -> [Zoom] {
+    let generated = autoZooms(events: events, style: edit.style)
     switch edit.zooms {
     case .auto:
-        return autoZooms(events: events, style: edit.style)
+        return generated
     case .explicit(let zooms):
-        return zooms.map { zoom in
-            Zoom(
-                t: zoom.t,
-                x: zoom.x,
-                y: zoom.y,
-                scale: zoom.scale > 0 ? zoom.scale : edit.style.zoomScale,
-                hold: zoom.hold
-            )
+        return mergeZooms(auto: generated, spec: CameraSpec(auto: true, add: zooms), style: edit.style)
+    case .camera(let spec):
+        return mergeZooms(auto: generated, spec: spec, style: edit.style)
+    }
+}
+
+func mergeZooms(auto: [Zoom], spec: CameraSpec, style: Style) -> [Zoom] {
+    var result = spec.auto ? auto : []
+    let removed = Set(spec.remove)
+    result.removeAll { zoom in
+        guard let id = zoom.id else { return false }
+        return removed.contains(id)
+    }
+    for (index, extra) in spec.add.enumerated() {
+        var zoom = extra
+        if zoom.scale <= 0 { zoom.scale = style.zoomScale }
+        if zoom.id == nil { zoom.id = "add-\(index + 1)" }
+        result.append(zoom)
+    }
+    for id in spec.tweak.keys.sorted() {
+        guard let tweak = spec.tweak[id], let index = result.firstIndex(where: { $0.id == id }) else { continue }
+        if let t = tweak.t { result[index].t = t }
+        if let x = tweak.x { result[index].x = x }
+        if let y = tweak.y { result[index].y = y }
+        if let scale = tweak.scale { result[index].scale = scale }
+        if let hold = tweak.hold { result[index].hold = hold }
+    }
+    return result
+}
+
+func quinticEase(_ value: Double) -> Double {
+    let t = min(1, max(0, value))
+    return t * t * t * (t * (t * 6 - 15) + 10)
+}
+
+struct OutputZoom {
+    var start: Double
+    var focus: CGPoint
+    var scale: Double
+    var easeIn: Double
+    var hold: Double
+    var easeOut: Double
+}
+
+/// Ease long enough that a quintic zoom stays under 1.2 /s on ln(scale).
+func outputEaseDuration(from startScale: Double, to endScale: Double, requested: Double) -> Double {
+    let delta = abs(log(max(endScale, 1.000001)) - log(max(startScale, 1.000001)))
+    let limited = delta * 1.875 / 1.2 + 0.004
+    return max(0.6, max(requested, limited))
+}
+
+func outputZoomStrength(at time: Double, zoom: OutputZoom) -> Double {
+    let end = zoom.start + zoom.easeIn + zoom.hold + zoom.easeOut
+    if time < zoom.start || time >= end { return 0 }
+    if time < zoom.start + zoom.easeIn {
+        if zoom.easeIn == 0 { return 1 }
+        return quinticEase((time - zoom.start) / zoom.easeIn)
+    }
+    if time < zoom.start + zoom.easeIn + zoom.hold { return 1 }
+    if zoom.easeOut == 0 { return 0 }
+    let progress = (time - zoom.start - zoom.easeIn - zoom.hold) / zoom.easeOut
+    return 1 - quinticEase(progress)
+}
+
+func zoomsOnOutputClock(_ zooms: [Zoom], map: TimeMap, style: Style) -> [OutputZoom] {
+    zooms.map { zoom in
+        let scale = max(1, zoom.scale)
+        return OutputZoom(
+            start: map.outputTime(at: zoom.t),
+            focus: CGPoint(x: zoom.x, y: zoom.y),
+            scale: scale,
+            easeIn: outputEaseDuration(from: 1, to: scale, requested: max(style.zoomIn, 0.6)),
+            hold: max(0, zoom.hold),
+            easeOut: outputEaseDuration(from: scale, to: 1, requested: max(style.zoomOut, 0.6))
+        )
+    }
+}
+
+func cameraOutput(at time: Double, zooms: [OutputZoom], cursor: CGPoint) -> (focus: CGPoint, scale: Double) {
+    var best = 0.0
+    var chosen: OutputZoom?
+    for zoom in zooms {
+        let strength = outputZoomStrength(at: time, zoom: zoom)
+        if strength > best {
+            best = strength
+            chosen = zoom
         }
     }
+    guard let chosen, best > 0 else { return (cursor, 1) }
+    let focus = CGPoint(
+        x: cursor.x + (chosen.focus.x - cursor.x) * best,
+        y: cursor.y + (chosen.focus.y - cursor.y) * best
+    )
+    let scale = 1 + (chosen.scale - 1) * best
+    return (focus, scale)
+}
+
+func cursorTrackOutput(events: [Event], frameCount: Int, fps: Double, map: TimeMap, fallback: CGPoint) -> [CGPoint] {
+    let points = events.filter { $0.type == "move" || $0.type == "click" || $0.type == "down" }
+    var raw: [CGPoint] = []
+    raw.reserveCapacity(frameCount)
+    for frame in 0..<frameCount {
+        let time = map.sourceTime(at: Double(frame) / max(fps, 1))
+        var current = points.first.map { CGPoint(x: $0.x, y: $0.y) } ?? fallback
+        for point in points where point.t <= time + 0.0001 {
+            current = CGPoint(x: point.x, y: point.y)
+        }
+        raw.append(current)
+    }
+    return smoothCursor(raw, fps: fps)
 }
 
 func parseColor(_ hex: String) throws -> (CGFloat, CGFloat, CGFloat) {
@@ -308,7 +446,7 @@ func editObject(from edit: EditList) -> [String: Any] {
         "blurs": edit.blurs.map { blurObject($0) },
         "covers": edit.covers.map { coverObject($0) },
         "segments": edit.segments.map { ["start": rounded3($0.start), "end": rounded3($0.end), "speed": rounded3($0.speed)] },
-        "cuts": edit.cuts.map { ["start": rounded3($0.start), "end": rounded3($0.end)] },
+        "cuts": edit.cuts.map { cutObject($0) },
         "steps": edit.steps.map { ["label": $0.label, "target": rounded3($0.target)] },
     ]
     for (key, value) in edit.passthrough where object[key] == nil {
@@ -319,6 +457,8 @@ func editObject(from edit: EditList) -> [String: Any] {
         object["zooms"] = "auto"
     case .explicit(let zooms):
         object["zooms"] = zooms.map { zoomObject($0) }
+    case .camera(let spec):
+        object["zooms"] = cameraObject(spec)
     }
     if let sourceSize = edit.sourceSize, sourceSize.width > 0, sourceSize.height > 0 {
         object["sourceSize"] = [
@@ -354,7 +494,7 @@ func parseEdit(_ object: [String: Any]) throws -> EditList {
     if let cuts = object["cuts"] as? [[String: Any]] {
         edit.cuts = cuts.compactMap { cut in
             guard let start = jsonDouble(cut["start"]), let end = jsonDouble(cut["end"]) else { return nil }
-            return Cut(start: start, end: end)
+            return Cut(start: start, end: end, id: cut["id"] as? String, manual: cut["manual"] as? Bool ?? false)
         }
     }
     if let steps = object["steps"] as? [[String: Any]] {
@@ -373,6 +513,8 @@ func parseEdit(_ object: [String: Any]) throws -> EditList {
         edit.zooms = .auto
     } else if let zooms = object["zooms"] as? [[String: Any]] {
         edit.zooms = .explicit(try zooms.map { try parseZoom($0, style: edit.style) })
+    } else if let zooms = object["zooms"] as? [String: Any] {
+        edit.zooms = .camera(try parseCamera(zooms, style: edit.style))
     } else if object["zooms"] != nil {
         throw ToolError("zooms must be \"auto\" or a list of {t, x, y, scale, hold}")
     }
@@ -419,13 +561,42 @@ func loadEvents(at url: URL) throws -> [Event] {
 }
 
 func zoomObject(_ zoom: Zoom) -> [String: Any] {
-    [
+    var object: [String: Any] = [
         "t": (zoom.t * 1000).rounded() / 1000,
         "x": (zoom.x * 10).rounded() / 10,
         "y": (zoom.y * 10).rounded() / 10,
         "scale": (zoom.scale * 100).rounded() / 100,
         "hold": (zoom.hold * 1000).rounded() / 1000,
     ]
+    if let id = zoom.id { object["id"] = id }
+    return object
+}
+
+private func cameraObject(_ spec: CameraSpec) -> [String: Any] {
+    var tweak: [String: [String: Any]] = [:]
+    for id in spec.tweak.keys.sorted() {
+        let value = spec.tweak[id]!
+        var fields: [String: Any] = [:]
+        if let t = value.t { fields["t"] = t }
+        if let x = value.x { fields["x"] = x }
+        if let y = value.y { fields["y"] = y }
+        if let scale = value.scale { fields["scale"] = scale }
+        if let hold = value.hold { fields["hold"] = hold }
+        tweak[id] = fields
+    }
+    return [
+        "auto": spec.auto,
+        "add": spec.add.map { zoomObject($0) },
+        "remove": spec.remove,
+        "tweak": tweak,
+    ]
+}
+
+private func cutObject(_ cut: Cut) -> [String: Any] {
+    var object: [String: Any] = ["start": rounded3(cut.start), "end": rounded3(cut.end)]
+    if let id = cut.id { object["id"] = id }
+    if cut.manual { object["manual"] = true }
+    return object
 }
 
 private func styleObject(_ style: Style) -> [String: Any] {
@@ -499,8 +670,31 @@ private func parseZoom(_ object: [String: Any], style: Style) throws -> Zoom {
         x: x,
         y: y,
         scale: jsonDouble(object["scale"]) ?? style.zoomScale,
-        hold: jsonDouble(object["hold"]) ?? style.zoomHold
+        hold: jsonDouble(object["hold"]) ?? style.zoomHold,
+        id: object["id"] as? String
     )
+}
+
+private func parseCamera(_ object: [String: Any], style: Style) throws -> CameraSpec {
+    var spec = CameraSpec()
+    if let auto = object["auto"] as? Bool { spec.auto = auto }
+    if let add = object["add"] as? [[String: Any]] {
+        spec.add = try add.map { try parseZoom($0, style: style) }
+    }
+    if let remove = object["remove"] as? [String] { spec.remove = remove }
+    if let tweak = object["tweak"] as? [String: [String: Any]] {
+        for id in tweak.keys.sorted() {
+            let fields = tweak[id] ?? [:]
+            spec.tweak[id] = ZoomTweak(
+                t: jsonDouble(fields["t"]),
+                x: jsonDouble(fields["x"]),
+                y: jsonDouble(fields["y"]),
+                scale: jsonDouble(fields["scale"]),
+                hold: jsonDouble(fields["hold"])
+            )
+        }
+    }
+    return spec
 }
 
 private func parseBlur(_ object: [String: Any]) throws -> BlurRect {

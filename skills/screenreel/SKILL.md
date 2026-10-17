@@ -84,6 +84,21 @@ screenreel timeline --take takes/<name>
 
 Open the stills. Check one cursor, readable type, blurred private text, and zooms that still show the result of the click. If a warning says a zoom is outside the frame or a long still has no actions, change `edit.json` and run `beautify` again.
 
+## Scripted lessons
+
+`python3 linux/screenreel make lesson.yaml` is the Linux path for a lesson file. It starts Xvfb `:90` at 1920x1080, opens Chrome with `launchPersistentContext` on `.screenreel/profiles/<profile>`, captures x11grab at 60 fps with `-draw_mouse 0`, and draws the cursor and camera in output time. The sample is `lessons/testfiesta-3-1.yaml`. URL and credentials are `${TESTFIESTA_URL}`, `${TESTFIESTA_USER}`, and `${TESTFIESTA_PASSWORD}`. Never write those values into the lesson.
+
+```bash
+python3 -m pip install -r linux/requirements.txt
+python3 linux/screenreel doctor
+python3 linux/screenreel lint lessons/testfiesta-3-1.yaml
+python3 linux/screenreel login --profile testfiesta
+python3 linux/screenreel make lessons/testfiesta-3-1.yaml --plan-only --allow-estimated-voice
+python3 linux/screenreel make lessons/testfiesta-3-1.yaml --preview
+```
+
+`make` prints one JSON object. `ok: false` is a non-zero exit. Audio mix, burned captions, and privacy OCR are still reported as `not_implemented`. A live `record` take still does not mix voice.
+
 Return the `out.mp4` path and the timeline.
 
-Do not launch Cursorful. Do not add voice, music, captions, or title cards inside this tool.
+Do not launch Cursorful.

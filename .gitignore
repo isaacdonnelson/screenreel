@@ -4,3 +4,7 @@
 takes/
 *.mov
 *.mp4
+.screenreel/
+__pycache__/
+.pytest_cache/
+*.pyc

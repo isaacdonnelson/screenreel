@@ -110,11 +110,69 @@ private func runChecks() throws {
     check(parsed.zooms == .auto && parsed.style.background == "#14141C" && parsed.blurs.count == 1, "edit list should round-trip")
     let explicit = try parseEdit([
         "zooms": [
-            ["t": 1.2, "x": 40, "y": 50, "scale": 1.8, "hold": 0.4],
+            ["t": 1.2, "x": 40, "y": 50, "scale": 1.8, "hold": 0.4, "id": "manual-1"],
         ],
     ])
-    let resolved = resolvedZooms(edit: explicit, events: [])
-    check(resolved.count == 1 && near(resolved[0].scale, 1.8) && near(resolved[0].hold, 0.4), "explicit zooms should replace auto")
+    let withClick = [Event(t: 1.0, type: "click", x: 10, y: 10, button: "left")]
+    let resolved = resolvedZooms(edit: explicit, events: withClick)
+    check(resolved.count == 2, "an added zoom list should keep the auto zoom, got \(resolved.count)")
+    check(resolved.contains { $0.id == "manual-1" } && resolved.contains { $0.id == "auto-click-1" }, "auto and manual zooms should both be present")
+
+    let cameraEdit = try parseEdit([
+        "zooms": [
+            "auto": true,
+            "add": [["t": 4.0, "x": 8, "y": 9, "id": "extra"]],
+            "remove": ["auto-click-1"],
+            "tweak": ["extra": ["scale": 1.25]],
+        ],
+    ])
+    let cameraZooms = resolvedZooms(edit: cameraEdit, events: withClick)
+    check(cameraZooms.count == 1 && cameraZooms.first?.id == "extra", "remove and add should leave the manual shot")
+    check(near(cameraZooms.first?.scale ?? 0, 1.25), "tweak by id should apply")
+
+    let hand = Cut(start: 4, end: 5, id: "hand-cut", manual: true)
+    let autoCut = [Cut(start: 1, end: 2, id: "auto-cut-1")]
+    let kept = mergeCuts(newAuto: autoCut, previousAuto: [], existing: [hand], overrides: [])
+    check(kept.contains { $0.id == "hand-cut" } && kept.contains { $0.id == "auto-cut-1" }, "plan should keep a hand-added cut")
+    let replanned = mergeCuts(
+        newAuto: [Cut(start: 1.5, end: 2.5, id: "auto-cut-1")],
+        previousAuto: autoCut,
+        existing: kept,
+        overrides: [Cut(start: 8, end: 9, id: "override-cut")]
+    )
+    check(replanned.contains { $0.id == "hand-cut" }, "replan keeps the hand cut")
+    check(replanned.contains { $0.id == "override-cut" }, "replan keeps overrides")
+    check(replanned.contains { $0.id == "auto-cut-1" && near($0.start, 1.5) }, "auto cut is regenerated")
+    check(!replanned.contains { near($0.start, 1) && near($0.end, 2) }, "the old auto span is not kept beside the new one")
+
+    let fast = buildTimeMap(duration: 12, segments: [Segment(start: 0, end: 12, speed: 6)], cuts: [])
+    let outputZooms = zoomsOnOutputClock(
+        [Zoom(t: 1, x: 400, y: 300, scale: 1.6, hold: 0.6)],
+        map: fast,
+        style: style
+    )
+    check(outputZooms[0].easeIn >= 0.6, "zoom ease stays on the output clock, got \(outputZooms[0].easeIn)")
+    let midway = outputZoomStrength(at: outputZooms[0].start + outputZooms[0].easeIn * 0.5, zoom: outputZooms[0])
+    check(near(midway, 0.5, tolerance: 0.02), "half of the output ease should be half strength, got \(midway)")
+    var peakRate = 0.0
+    var previousScale = 1.0
+    let frames = Int((outputZooms[0].easeIn * 60).rounded(.up))
+    for frame in 1...frames {
+        let time = outputZooms[0].start + Double(frame) / 60
+        let strength = outputZoomStrength(at: time, zoom: outputZooms[0])
+        let scale = 1 + (outputZooms[0].scale - 1) * strength
+        let rate = abs(log(scale) - log(previousScale)) * 60
+        peakRate = max(peakRate, rate)
+        previousScale = scale
+    }
+    check(peakRate <= 1.21, "zoom rate should stay near 1.2 /s, got \(peakRate)")
+    var visibleRipple = 0
+    let clickAt = 2.0
+    for frame in 0..<Int(fast.outputDuration * 60) {
+        let age = rippleAge(outputTime: Double(frame) / 60, eventSourceTime: clickAt, map: fast)
+        if age >= 0 && age <= 0.45 { visibleRipple += 1 }
+    }
+    check(visibleRipple >= 24, "a ripple inside a 6x ramp should still last 24 frames, got \(visibleRipple)")
 
     let source = makeSolidImage(width: 40, height: 20, top: (1, 0, 0), bottom: (0, 0, 1))
     var canvas = Canvas()
@@ -151,6 +209,44 @@ private func runChecks() throws {
     let bottom = pixel(of: image, x: Int(window.dest.midX), y: Int(window.dest.maxY) - 3)
     check(top.0 > 200 && top.2 < 40, "top of window should be red, got \(top)")
     check(bottom.2 > 200 && bottom.0 < 40, "bottom of window should be blue, got \(bottom)")
+
+    let patterned = makeCheckerImage(width: 200, height: 120)
+    var blurCanvas = Canvas()
+    blurCanvas.width = 200
+    blurCanvas.height = 120
+    var blurStyle = Style()
+    blurStyle.padding = 0
+    blurStyle.shadow = 0
+    blurStyle.radius = 0
+    blurStyle.background = "#000000"
+    let blurred = try renderFrame(
+        source: patterned,
+        canvas: blurCanvas,
+        style: blurStyle,
+        cursor: nil,
+        focus: CGPoint(x: 100, y: 60),
+        zoomScale: 1,
+        ripples: [],
+        blurs: [BlurRect(x: 0, y: 0, width: 100, height: 50, radius: 8)],
+        context: CIContext()
+    )
+    let topLeft = pixel(of: blurred, x: 10, y: 10)
+    let bottomLeft = pixel(of: blurred, x: 10, y: 100)
+    check(topLeft.0 > 40 && topLeft.1 > 40, "rect (0, 0, 100, 50) should blur the top-left checker, got \(topLeft)")
+    check(bottomLeft.2 > 200 && bottomLeft.0 < 40, "the same rect should leave the bottom-left blue, got \(bottomLeft)")
+    let zoomed = try renderFrame(
+        source: patterned,
+        canvas: blurCanvas,
+        style: blurStyle,
+        cursor: nil,
+        focus: CGPoint(x: 40, y: 20),
+        zoomScale: 2,
+        ripples: [],
+        blurs: [BlurRect(x: 0, y: 0, width: 100, height: 50, radius: 8)],
+        context: CIContext()
+    )
+    let zoomedTop = pixel(of: zoomed, x: zoomed.width / 2, y: 30)
+    check(zoomedTop.0 > 40 && zoomedTop.1 > 40, "a zoom should not reveal the blurred top-left, got \(zoomedTop)")
 
     let encoded = makeSolidImage(width: 64, height: 32, top: (1, 0, 0), bottom: (0, 0, 1))
     let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("screenreel-orient-\(UUID().uuidString).mp4")
