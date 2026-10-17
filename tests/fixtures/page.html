@@ -4,7 +4,18 @@
   <meta charset="utf-8">
   <title>Fixture</title>
   <style>
-    body { margin: 0; background: #f8fafc; font-family: sans-serif; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      min-height: 100%;
+      font-family: sans-serif;
+      background-color: #f8fafc;
+      background-image: repeating-linear-gradient(
+        90deg,
+        #0f172a 0 18px,
+        #f8fafc 18px 36px
+      );
+    }
     button {
       position: absolute;
       left: 720px;

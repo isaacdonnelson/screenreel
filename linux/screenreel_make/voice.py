@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -87,8 +88,9 @@ def schedule(lesson: Lesson, tracks: dict[str, list[dict[str, Any]]]) -> dict[st
         ]
         counts: dict[str, int] = {}
         step_actions = []
+        pending: list[dict[str, Any]] = []
         for action in step.actions:
-            if action.kind in {"goto", "scroll_into_view", "wait_for", "script"} and not action.at:
+            if action.kind in {"goto", "scroll_into_view", "scroll", "wait_for", "script", "narrate"} and not action.at:
                 continue
             if action.kind == "hold" and not action.at:
                 continue
@@ -103,14 +105,14 @@ def schedule(lesson: Lesson, tracks: dict[str, list[dict[str, Any]]]) -> dict[st
                         step=step.id,
                         code="anchor_missing",
                     )
-            press = (anchor_t + lead) if anchor_t is not None else cursor + 0.5
-            planned = {
+            press = (anchor_t + lead) if anchor_t is not None else None
+            pending.append({
                 "id": ident,
                 "step": step.id,
                 "kind": action.kind,
                 "at": action.at,
                 "anchor_t": anchor_t,
-                "press": round(press, 3),
+                "press": None if press is None else round(press, 3),
                 "lead": lead,
                 "text": action.text,
                 "spec": action.spec,
@@ -119,23 +121,41 @@ def schedule(lesson: Lesson, tracks: dict[str, list[dict[str, Any]]]) -> dict[st
                 "expect_value": action.expect_value,
                 "paste": action.paste,
                 "hold": action.seconds,
-            }
-            actions.append(planned)
-            step_actions.append({
-                "id": ident,
-                "press": planned["press"],
-                "anchor": action.at,
-                "anchor_t": anchor_t,
-                "slip": 0.0,
             })
         spoken_end = shifted[-1]["end"] if shifted else step_t0 + 0.8
+        loose = [item for item in pending if item["press"] is None]
+        span_start = step_t0 + 0.35
+        span_end = max(span_start + 0.2, spoken_end - 0.05)
+        if len(loose) == 1:
+            loose[0]["press"] = round((span_start + span_end) / 2, 3)
+        elif loose:
+            gap = (span_end - span_start) / (len(loose) - 1)
+            for index, item in enumerate(loose):
+                item["press"] = round(span_start + gap * index, 3)
+        for planned in pending:
+            actions.append(planned)
+            step_actions.append({
+                "id": planned["id"],
+                "press": planned["press"],
+                "anchor": planned["at"],
+                "anchor_t": planned["anchor_t"],
+                "slip": 0.0,
+            })
         last_press = max((item["press"] for item in step_actions), default=spoken_end)
-        step_t1 = max(spoken_end, last_press) + 0.4
+        holds = sum(float(action.seconds or 0) for action in step.actions if action.kind == "hold")
+        # Tail stays under 0.8 s unless the step asks to hold.
+        step_t1 = max(spoken_end, last_press) + 0.4 + holds
+        audio_origin = (shifted[0]["start"] - float(words[0]["start"])) if words else step_t0
+        audio_end = (audio_origin + float(words[-1]["end"])) if words else spoken_end
+        if audio_end > step_t1:
+            step_t1 = audio_end + 0.05
         steps.append({
             "id": step.id,
             "label": step.label,
             "t0": round(step_t0, 3),
             "t1": round(step_t1, 3),
+            "audio_start": round(audio_origin, 3),
+            "audio_end": round(audio_end, 3),
             "actions": step_actions,
         })
         cursor = step_t1
@@ -308,9 +328,10 @@ def fetch_elevenlabs(
 ) -> dict[str, Any]:
     """POST with-timestamps, then text-to-dialogue. Retry three times."""
     open_url = opener or urllib.request.urlopen
+    output_format = "mp3_44100_192"
     endpoints = [
-        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps",
-        "https://api.elevenlabs.io/v1/text-to-dialogue/with-timestamps",
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps?output_format={output_format}",
+        f"https://api.elevenlabs.io/v1/text-to-dialogue/with-timestamps?output_format={output_format}",
     ]
     body_for = [
         {"text": text, "model_id": model},
@@ -354,7 +375,7 @@ def prepare_tracks(
     opener: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     provider = str(lesson.voice.get("provider") or "elevenlabs")
-    voice_id = str(lesson.voice.get("voice_id") or "")
+    voice_id = str(lesson.voice.get("voice_id") or "7EzWGsX10sAS4c9m9cPf")
     model = str(lesson.voice.get("model") or "eleven_v3")
     settings = {key: lesson.voice.get(key) for key in ("stability", "similarity_boost", "style") if key in lesson.voice}
     texts: list[tuple[str, str]] = []
@@ -364,32 +385,130 @@ def prepare_tracks(
         texts.append((step.id, step.say))
     tracks: dict[str, list[dict[str, Any]]] = {}
     audio: dict[str, str] = {}
+    clips = {step.id: step.audio for step in lesson.steps if step.audio}
     estimated = provider == "estimated" or allow_estimated
     api_key = os.environ.get("ELEVENLABS_API_KEY", "")
     if provider == "elevenlabs" and not allow_estimated:
-        if not api_key:
-            raise LessonError(
-                "ELEVENLABS_API_KEY is not set. Pass --allow-estimated-voice to plan with even word timings.",
-                code="voice_unavailable",
-            )
         estimated = False
+    files: dict[str, str] = {}
     for ident, text in texts:
-        key = cache_key(text, voice_id, model, settings)
+        if ident in clips and os.path.exists(clips[ident]):
+            tracks[ident] = align_clip(clips[ident], text, api_key=api_key)
+            files[ident] = clips[ident]
+            continue
+        key = cache_key(text, voice_id, model, {**settings, "format": "mp3_44100_192"})
         cached = load_cached_voice(cache_dir, key) if reuse else None
         if cached and cached.get("words"):
             tracks[ident] = cached["words"]
             if cached.get("audio_base64"):
                 audio[ident] = cached["audio_base64"]
+            if cached.get("path"):
+                files[ident] = cached["path"]
             continue
         if estimated:
             tracks[ident] = estimate_words(text)
             continue
+        if not api_key:
+            raise LessonError(
+                "ELEVENLABS_API_KEY is not set. Pass --allow-estimated-voice to plan with even word timings.",
+                code="voice_unavailable",
+            )
         fetched = fetch_elevenlabs(text, voice_id, model, api_key, opener=opener)
         store_cached_voice(cache_dir, key, {"words": fetched["words"], "audio_base64": fetched.get("audio_base64") or ""})
         tracks[ident] = fetched["words"]
         if fetched.get("audio_base64"):
             audio[ident] = fetched["audio_base64"]
-    return {"tracks": tracks, "audio": audio, "estimated": estimated and provider != "elevenlabs"}
+    return {
+        "tracks": tracks,
+        "audio": audio,
+        "files": files,
+        "estimated": estimated or provider == "estimated",
+    }
+
+
+def align_clip(
+    path: str,
+    text: str,
+    api_key: str = "",
+    aligner: Callable[[str, str], list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Word timings for a prerecorded clip.
+
+    A sidecar `<clip>.words.json` wins. Otherwise an aligner (tests, or
+    ElevenLabs forced alignment) runs. With neither, words share the clip
+    duration evenly.
+    """
+    sidecar = path + ".words.json"
+    if os.path.exists(sidecar):
+        with open(sidecar, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            return words_from_alignment(payload)
+        return list(payload)
+    if aligner is not None:
+        return aligner(path, text)
+    if api_key:
+        try:
+            return _forced_alignment(path, text, api_key)
+        except LessonError:
+            pass
+    duration = _probe_duration(path) or 0.32 * max(1, len(words_in(text)))
+    tokens = words_in(text) or ["..."]
+    slice_len = duration / len(tokens)
+    return [
+        {"word": token, "start": round(index * slice_len, 3), "end": round((index + 1) * slice_len, 3)}
+        for index, token in enumerate(tokens)
+    ]
+
+
+def _probe_duration(path: str) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return 0.0
+    try:
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def _forced_alignment(path: str, text: str, api_key: str) -> list[dict[str, Any]]:
+    import mimetypes
+
+    boundary = "----screenreel"
+    filename = os.path.basename(path)
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode(),
+        f"Content-Type: {mime}\r\n\r\n".encode(),
+        blob,
+        f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\n{text}\r\n--{boundary}--\r\n".encode(),
+    ])
+    request = urllib.request.Request(
+        "https://api.elevenlabs.io/v1/forced-alignment",
+        data=body,
+        headers={"xi-api-key": api_key, "content-type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as error:  # noqa: BLE001
+        raise LessonError(str(error), code="voice_unavailable") from error
+    words = payload.get("words")
+    if isinstance(words, list) and words:
+        return [{"word": item.get("text") or item.get("word"), "start": item.get("start"), "end": item.get("end")} for item in words]
+    alignment = payload.get("alignment") or {}
+    parsed = words_from_alignment(alignment)
+    if not parsed:
+        raise LessonError("Forced alignment returned no words", code="voice_unavailable")
+    return parsed
 
 
 def write_audio_files(audio: dict[str, str], directory: str) -> None:

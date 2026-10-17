@@ -210,12 +210,14 @@ def _sample(knots: list[tuple[float, float, float, float]], duration: float, fps
         else:
             moving = abs(right[1] - left[1]) + abs(right[2] - left[2]) + abs(right[3] - left[3]) > 1e-3
             u = quintic((t - left[0]) / span) if moving else (t - left[0]) / span
-            if not moving and span >= 2.0:
-                # Slow drift so a settled narration shot is not a frozen picture.
-                drift = 0.015 * math.sin(math.pi * (t - left[0]) / span)
+            if not moving and span >= 0.8:
+                # A sine over the whole hold stops at the crest, and the frozen
+                # check then sees a still. This wobble stays non-negative so a
+                # wide shot at 1.0x still moves, and its rate stays far under 1.2.
+                wobble = 0.02 * (0.5 - 0.5 * math.cos(2 * math.pi * (t - left[0]) / 1.2))
                 cx = left[1]
                 cy = left[2]
-                scale = left[3] * (1.0 + drift)
+                scale = left[3] * (1.0 + wobble)
             else:
                 cx = left[1] + (right[1] - left[1]) * u
                 cy = left[2] + (right[2] - left[2]) * u

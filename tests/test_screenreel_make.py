@@ -53,7 +53,7 @@ def test_sample_lesson_validates_and_keeps_secrets_out_of_the_file():
     lesson = load_lesson(str(SAMPLE), environ=ENV)
     assert lesson.lesson == "3-1"
     assert lesson.base_url == "https://practice.example.test"
-    assert any(action.at == "Create" for action in lesson.steps[0].actions)
+    assert any(action.at == "click" for action in lesson.steps[0].actions)
     with pytest.raises(LessonError) as missing:
         load_lesson(str(SAMPLE), environ={})
     assert missing.value.code == "env_missing"

@@ -77,6 +77,7 @@ def _inject(page: Any, lesson: Lesson, keep_toasts: bool) -> None:
         }""",
         css,
     )
+    _replace_text(page, lesson)
 
 
 def _origin(page: Any) -> dict[str, float]:
@@ -183,7 +184,7 @@ def key_delays(text: str, finish_in: float | None = None, seed: int = 1) -> list
 
     rng = random.Random(seed)
     long_text = len(text) > 40
-    low, high = (0.030, 0.050) if long_text else (0.045, 0.080)
+    low, high = (0.030, 0.050) if long_text else (0.056, 0.084)
     delays = []
     for char in text:
         base = rng.uniform(low, high)
@@ -221,18 +222,11 @@ def run_lesson(
     try:
         _inject(page, lesson, False)
         for hook in lesson.setup:
-            if "goto" in hook:
-                _goto(page, lesson, str(hook["goto"]))
-            elif "script" in hook:
-                write({
-                    "t": round(time.monotonic() - clock_origin, 3),
-                    "type": "warning",
-                    "code": "setup_hook_not_run",
-                    "message": f"Setup script {hook.get('script')} is not built in yet",
-                })
+            _run_hook(page, lesson, hook, write, clock_origin)
         by_id = {item["id"]: item for item in planned}
         for step in lesson.steps:
             _inject(page, lesson, step.keep_toasts)
+            _sample_masks(page, lesson, clock_origin, write)
             for action in step.actions:
                 ident = _match_id(step.id, action, by_id, used)
                 plan = by_id.get(ident) if ident else None
@@ -241,9 +235,16 @@ def run_lesson(
                     settled = wait_settled(page)
                     write({"t": round(settled - clock_origin, 3), "type": "goto", "id": ident, "url": page.url, "step": step.id})
                     continue
-                if action.kind == "scroll_into_view":
+                if action.kind in {"scroll_into_view", "scroll"}:
                     loc = _resolve(page, action.spec, step.id)
                     loc.scroll_into_view_if_needed(timeout=8000)
+                    continue
+                if action.kind == "check":
+                    _wait_for(page, action.spec or action.wait_for, step.id)
+                    continue
+                if action.kind in {"narrate", "shell"}:
+                    if action.kind == "shell" and action.text:
+                        _run_shell(action.text)
                     continue
                 if action.kind == "wait_for":
                     _wait_for(page, action.wait_for or action.spec, step.id)
@@ -252,20 +253,24 @@ def run_lesson(
                     time.sleep(float(action.seconds or 0))
                     continue
                 if action.kind == "script":
-                    write({
-                        "t": round(time.monotonic() - clock_origin, 3),
-                        "type": "warning",
-                        "code": "setup_hook_not_run",
-                        "step": step.id,
-                        "message": f"Script {action.text} is not built in yet",
-                    })
+                    ran = _builtin_script(page, {"script": action.text, "args": action.spec})
+                    if not ran:
+                        write({
+                            "t": round(time.monotonic() - clock_origin, 3),
+                            "type": "warning",
+                            "code": "setup_hook_not_run",
+                            "step": step.id,
+                            "message": f"Script {action.text} is not built in yet",
+                        })
                     continue
-                if action.kind in {"click", "select", "type"}:
+                if action.kind in {"click", "select", "type", "hover"}:
                     cursor, travel_index = _perform(
                         page, lesson, step.id, action, plan, cursor, travel_index, clock_origin, write
                     )
                     continue
                 raise LessonError(f"Unknown action {action.kind}", step=step.id)
+        for hook in lesson.teardown:
+            _run_hook(page, lesson, hook, write, clock_origin)
     finally:
         handle.close()
     return events
@@ -342,6 +347,20 @@ def _perform(page, lesson, step, action, plan, cursor, travel_index, clock_origi
     travel = plan_travel(cursor, center, press_output, travel_index)
     _wait_until(clock_origin, travel.t0)
     _move_along(page, travel, origin, clock_origin)
+    if action.kind == "hover":
+        _wait_until(clock_origin, press_output)
+        page.mouse.move((center.x - origin["x"]) / (origin["dpr"] or 1), (center.y - origin["y"]) / (origin["dpr"] or 1))
+        write({
+            "t": round(time.monotonic() - clock_origin, 3),
+            "type": "hover",
+            "id": plan["id"] if plan else None,
+            "step": step,
+            "x": round(center.x, 2),
+            "y": round(center.y, 2),
+            "box": {key: round(box[key], 2) for key in ("x", "y", "w", "h")},
+            "url": page.url,
+        })
+        return center, travel_index + 1
     if action.kind in {"click", "select"}:
         _wait_until(clock_origin, press_output)
         page.mouse.down()
@@ -445,6 +464,137 @@ def _move_along(page: Any, travel, origin: dict[str, float], clock_origin: float
         css_x = (point.x - origin["x"]) / dpr
         css_y = (point.y - origin["y"]) / dpr
         page.mouse.move(css_x, css_y)
+
+
+def _run_shell(command: str) -> None:
+    import subprocess
+    subprocess.run(command, shell=True, check=False)
+
+
+def _run_hook(page, lesson, hook, write, clock_origin) -> None:
+    if "goto" in hook:
+        _goto(page, lesson, str(hook["goto"]))
+        return
+    if "shell" in hook:
+        _run_shell(str(hook["shell"]))
+        return
+    if "script" in hook and _builtin_script(page, hook):
+        return
+    if "script" in hook:
+        write({
+            "t": round(time.monotonic() - clock_origin, 3),
+            "type": "warning",
+            "code": "setup_hook_not_run",
+            "message": f"Setup script {hook.get('script')} is not built in yet",
+        })
+
+
+def _builtin_script(page: Any, hook: dict[str, Any]) -> bool:
+    name = str(hook.get("script") or "")
+    if name != "archive_runs_named":
+        return False
+    prefix = str((hook.get("args") or {}).get("prefix") or "")
+    try:
+        rows = page.get_by_role("row").filter(has_text=prefix)
+        count = rows.count()
+        for index in range(min(count, 8)):
+            row = rows.nth(index)
+            button = row.get_by_role("button", name="Archive")
+            if button.count():
+                button.first.click(timeout=2000)
+    except Exception:
+        return True
+    return True
+
+
+def _replace_text(page: Any, lesson: Lesson) -> None:
+    items = [item for item in (lesson.app.get("mask") or []) if isinstance(item, dict) and item.get("mode") == "replace"]
+    items += [item for item in (lesson.app.get("replace_text") or []) if isinstance(item, dict)]
+    for item in items:
+        selector = item.get("selector")
+        text = item.get("text")
+        if not selector or text is None:
+            continue
+        try:
+            page.eval_on_selector_all(
+                str(selector),
+                "(els, value) => els.forEach((el) => { el.textContent = value; })",
+                str(text),
+            )
+        except Exception:
+            continue
+
+
+def _sample_masks(page: Any, lesson: Lesson, clock_origin: float, write) -> None:
+    origin = _origin(page)
+    boxes = []
+    for item in lesson.app.get("mask") or []:
+        if not isinstance(item, dict) or not item.get("selector") or item.get("mode") == "replace":
+            continue
+        try:
+            loc = page.locator(str(item["selector"]))
+            count = min(loc.count(), 6)
+            for index in range(count):
+                css = loc.nth(index).bounding_box()
+                if not css:
+                    continue
+                box = screen_box(css, origin)
+                boxes.append({
+                    "x": round(box["x"], 2),
+                    "y": round(box["y"], 2),
+                    "width": round(box["w"], 2),
+                    "height": round(box["h"], 2),
+                    "radius": float(item.get("radius") or 18),
+                })
+        except Exception:
+            continue
+    if boxes:
+        write({
+            "t": round(time.monotonic() - clock_origin, 3),
+            "type": "mask",
+            "boxes": boxes,
+        })
+
+
+def inspect_url(url: str, display: str) -> dict[str, Any]:
+    from playwright.sync_api import sync_playwright
+
+    lesson = Lesson(
+        lesson="inspect",
+        title="inspect",
+        output="",
+        raw={},
+        app={"profile": "inspect", "base_url": url, "viewport": {"width": 1440, "height": 810, "scale": 1}},
+        style={},
+        voice={"provider": "estimated"},
+        audio={},
+        steps=[],
+    )
+    with sync_playwright() as playwright:
+        context, page = launch(playwright, lesson, display)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            elements = list_clickable(page)
+            picture = os.path.join("/tmp", "screenreel-inspect-url.png")
+            page.screenshot(path=picture)
+        finally:
+            context.close()
+    return {"ok": True, "url": url, "elements": elements, "screenshot": picture}
+
+
+def list_clickable(page: Any, limit: int = 40) -> list[dict[str, str]]:
+    raw = page.evaluate(
+        """(limit) => {
+            const nodes = Array.from(document.querySelectorAll('button, a, input, textarea, select, [role="button"], [role="link"], [role="checkbox"]'));
+            return nodes.slice(0, limit).map((el) => ({
+                role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                name: (el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || '').trim().slice(0, 80),
+                selector: el.id ? '#' + el.id : el.tagName.toLowerCase()
+            }));
+        }""",
+        limit,
+    )
+    return [dict(item) for item in raw]
 
 
 def inspect_lesson(lesson: Lesson, display: str, only: str | None = None) -> dict[str, Any]:
