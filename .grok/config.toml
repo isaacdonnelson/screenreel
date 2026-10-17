@@ -1,0 +1,3 @@
+[mcp_servers.screenreel]
+command = "python3"
+args = ["linux/mcp_server.py"]

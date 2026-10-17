@@ -9,70 +9,46 @@ description: >
 
 # Screenreel
 
-Record the screen, then render a demo from an edit list. The brand color, zooms, blurs, covers, and speed live in `edit.json`. Nothing about a particular product is baked into the tool.
+Record on the computer that can click the product. Render on the Mac. The take folder is the same in both places. Brand color, zooms, blurs, covers, and speed live in `edit.json`.
 
-The clicking computer and the rendering computer can be different. The take folder is the same on both.
+Every command prints one JSON object. A non-zero exit means `"ok": false`. Read `warnings` before you deliver the video.
 
-- Linux, where the bot clicks: `/Users/isaacdonnelson/git/screenreel/linux/screenreel`
-- Mac, where the picture is rendered: `screenreel` on `PATH` (`~/.local/bin/screenreel`)
+## Install on the Linux computer
 
-Source: `/Users/isaacdonnelson/git/screenreel`.
+If `screenreel doctor` is not found, install it. On a Grok Bot computer the files land in `/workspace/screenreel`, which survives a computer update. Then put `~/.local/bin` on `PATH`.
 
-If the Mac binary is missing:
+```bash
+curl -fsSL https://raw.githubusercontent.com/isaacdonnelson/screenreel/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+screenreel doctor
+```
+
+`doctor` must report `"ok": true` and a `DISPLAY`. The capture hides the X cursor. Repo: https://github.com/isaacdonnelson/screenreel
+
+Three ways to drive the same recorder:
+
+- CLI: `screenreel doctor`, `screenreel record start --take takes/<name>`, `screenreel mark --take takes/<name> --label "step 2: name"`, `screenreel record stop --take takes/<name>`
+- MCP, already connected: call `screenreel_doctor`, `screenreel_record_start`, `screenreel_mark`, `screenreel_record_stop`. The command on this computer is `python3 /workspace/screenreel/linux/mcp_server.py`. In Grok, add that as a custom MCP command plugin. From a checkout, `grok mcp add screenreel -- python3 linux/mcp_server.py`.
+- API, on this computer: `screenreel api` then `curl -s localhost:8765/v1/doctor`. Record with POST `/v1/record/start`, `/v1/mark`, and `/v1/record/stop`, JSON body `{"take":"takes/<name>","label":"step 2: name"}`. `POST /mcp` on that same port is the MCP HTTP endpoint. A remote Grok connector needs a public tunnel to this process, and the process must stay on the computer that has `DISPLAY`. See [Custom MCP connectors](https://docs.x.ai/grok/connectors) and [tunneling](https://docs.x.ai/grok/connectors/custom-mcp-tunneling).
+
+Read `$ROOT/skills/screenreel/SKILL.md` after install if you need this page on the Linux computer. The skill text is also in the repo at `skills/screenreel/SKILL.md`.
+
+Prefer a display near 1920x1200, the browser full screen, and a steady pace. Optional flags: `--crop x,y,w,h`, `--fps 30`. Type at about 70 ms per key and check the field afterward. Dismiss overlays before recording. Key characters are never logged.
+
+After `record stop`, copy the take folder to the Mac.
+
+## Mac render
+
+The Mac binary is `screenreel` on `PATH`. If it is missing:
 
 ```bash
 make -C /Users/isaacdonnelson/git/screenreel install
 ```
 
-Every command prints one JSON object on stdout. A non-zero exit means `"ok": false`. Read `warnings` before you deliver the video.
-
-## Where to record
-
-Record on the machine that can click the product.
-
-On the Linux display, from the repo copy on that machine:
+Record on the Mac only when the clicks happen on the Mac. `doctor` names the app that needs Screen Recording and Accessibility. That permission sticks to the app that launches the binary.
 
 ```bash
-python3 linux/screenreel doctor
-python3 linux/screenreel record start --take takes/<name>
-python3 linux/screenreel mark --take takes/<name> --label "step 2: name"
-python3 linux/screenreel record stop --take takes/<name>
-```
-
-`doctor` must see `DISPLAY`. The capture hides the X cursor. Copy the take folder to the Mac when the raw file is closed.
-
-On the Mac, only when something on the Mac will do the clicking:
-
-```bash
-screenreel doctor
-screenreel record start --take takes/<name>
-screenreel mark --take takes/<name> --label "step 2: name"
-screenreel record stop --take takes/<name>
-```
-
-`doctor` names the app that needs Screen Recording and Accessibility. That permission sticks to the app that launches the binary. An agent shell is not Terminal. Key characters are never logged.
-
-Prefer a display near 1920x1200, the browser full screen, and a steady pace. Optional flags: `--display <id>`, `--crop x,y,w,h`, `--fps 30`.
-
-## Edit list
-
-`screenreel plan --take takes/<name>` on the Mac writes speed segments and cuts of long waits into `edit.json`. It keeps `"zooms": "auto"`. A `secret` event becomes a timed blur.
-
-Then change the file when the picture needs it:
-
-- `style.background`, `padding`, `radius`, `shadow`, `cursorScale`, `zoomScale`, `zoomIn`, `zoomHold`, `zoomOut`
-- For a TestFiesta lesson, background `#1E1B4B` and radius `16` match the product. Other products pass their own hex.
-- `blurs` and `covers`: `{ "x", "y", "width", "height", "t0", "t1" }`. A cover also takes `color`. Times are source seconds. Omit them to cover the whole take.
-- `segments`: `{ "start", "end", "speed" }`. `cuts`: `{ "start", "end" }`.
-- `steps`: `{ "label", "target" }` so `plan` fits that marker's step to the voice length, speeding waits first.
-- `zooms`: `"auto"`, or `{ "t", "x", "y", "scale", "hold" }`.
-- `audio`, `overlays`, `duck`, and `lufs` are kept for the voice mix. The binary does not mix them.
-
-## Render and check
-
-On the Mac:
-
-```bash
+screenreel plan --take takes/<name>
 screenreel beautify --take takes/<name> --preview
 screenreel beautify --take takes/<name>
 screenreel frames --take takes/<name> --markers
@@ -80,9 +56,13 @@ screenreel frames --take takes/<name> --every 5
 screenreel timeline --take takes/<name>
 ```
 
-`--preview` writes `preview.mp4` at 960x540. The full render writes `out.mp4` at the canvas size, normally 1920x1080. `timeline.json` has each marker's output `t0` and `t1` so a voice clip can be lined up later.
+`--preview` writes `preview.mp4` at 960x540. The full render writes `out.mp4` at 1920x1080. `timeline.json` has each marker's output `t0` and `t1`.
 
-Open the stills. Check one cursor, readable type, blurred private text, and zooms that still show the result of the click. If a warning says a zoom is outside the frame or a long still has no actions, change `edit.json` and run `beautify` again.
+For a TestFiesta lesson set `style.background` to `#1E1B4B` and `style.radius` to `16` in `edit.json`. Other products pass their own hex. The default background is `#14141C`.
+
+`plan` writes speed segments and cuts of long waits. It keeps `"zooms": "auto"`. A `secret` event becomes a timed blur. `steps` of `{ "label", "target" }` fit a marker's step to a voice length. `blurs` and `covers` take `t0` and `t1` in source seconds. `audio`, `overlays`, `duck`, and `lufs` stay in the file for a later mix. This tool does not mix them.
+
+Open the stills. Check one cursor, readable type, blurred private text, and zooms that still show the result of the click. Change `edit.json` and run `beautify` again when a warning says a zoom is outside the frame or a long still has no actions.
 
 Return the `out.mp4` path and the timeline.
 

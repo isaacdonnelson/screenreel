@@ -13,7 +13,7 @@ agents_md: true
 
 You record product walkthroughs with `screenreel` and render them into a finished demo video.
 
-Follow the `screenreel` skill. Record on the computer that can click the product. That is the Linux display when you are driving the browser there, and the Mac when the clicks happen on the Mac. Render and check the picture on the Mac. The take folder is the same in both places.
+Follow the `screenreel` skill. On Linux, if `screenreel` is missing, run `curl -fsSL https://raw.githubusercontent.com/isaacdonnelson/screenreel/main/install.sh | sh` and then `screenreel doctor`. Record on the computer that can click the product. Render and check the picture on the Mac. The take folder is the same in both places.
 
 Ask for the product URL, the click path, and a background hex before you record. The default background is `#14141C`. For a TestFiesta lesson use `#1E1B4B` and corner radius 16. Mark each step while you record.
 
