@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Linux capture for screenreel.
+"""Linux screenreel.
 
-Writes the same take folder as the Mac binary: raw.mov, events.jsonl, edit.json.
-The picture is rendered on the Mac with `screenreel beautify`. Hide the X cursor
-with ffmpeg x11grab draw_mouse=0 and log the real pointer with xinput.
+`record` writes the same take folder as the Mac binary. `make lesson.yaml`
+drives a dedicated Chrome profile on its own Xvfb display and renders the
+cursor, camera, and ripples in output time.
 """
 
 import json
@@ -13,6 +13,9 @@ import signal
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from screenreel_make.marks import append_mark, drain_inbox  # noqa: E402
 
 RAW = "raw.mov"
 EVENTS = "events.jsonl"
@@ -54,10 +57,14 @@ def display_size():
     return display, 1920, 1200
 
 
+def _have(tool):
+    return subprocess.call(["bash", "-lc", f"command -v {tool}"], stdout=subprocess.DEVNULL) == 0
+
+
 def doctor():
     missing = []
     for tool in ("ffmpeg", "xinput", "xdpyinfo"):
-        if subprocess.call(["bash", "-lc", f"command -v {tool}"], stdout=subprocess.DEVNULL) != 0:
+        if not _have(tool):
             missing.append(tool)
     display = os.environ.get("DISPLAY")
     ok = not missing and bool(display)
@@ -66,12 +73,18 @@ def doctor():
         message = "DISPLAY is not set. This recorder needs the X display the browser is on."
     elif missing:
         message = "Install " + ", ".join(missing) + " before recording."
+    scripted_missing = [tool for tool in ("ffmpeg", "Xvfb", "google-chrome") if not _have(tool)]
     emit({
         "ok": ok,
         "platform": "linux",
         "display": display,
         "missing": missing,
         "message": message,
+        "scripted": {
+            "ready": not scripted_missing,
+            "missing": scripted_missing,
+            "elevenlabs_key": bool(os.environ.get("ELEVENLABS_API_KEY")),
+        },
     })
 
 
@@ -178,6 +191,8 @@ def record_run(args):
         "width": width,
         "height": height,
         "platform": "linux",
+        "clock": "CLOCK_MONOTONIC",
+        "started_mono": started,
     })
     stop = {"value": False}
 
@@ -195,8 +210,7 @@ def record_run(args):
         }) + "\n")
         events.flush()
         while not stop["value"]:
-            _drain_inbox(take, events, started, inbox_offset)
-            inbox_offset = _inbox_size(take)
+            inbox_offset = _drain_inbox(take, events, started, inbox_offset)
             if xinput.stdout is None or not select.select([xinput.stdout], [], [], 0.05)[0]:
                 continue
             line = xinput.stdout.readline()
@@ -233,6 +247,7 @@ def record_run(args):
                     }) + "\n")
                 events.flush()
                 pending_x = None
+        inbox_offset = _drain_inbox(take, events, started, inbox_offset)
         xinput.terminate()
         ffmpeg.send_signal(signal.SIGINT)
         try:
@@ -303,7 +318,7 @@ def record_stop(args):
         "edit": edit_path,
         "duration": session.get("duration", 0),
         "sourceSize": {"width": session.get("width", 0), "height": session.get("height", 0)},
-        "message": "Copy this take to the Mac and run screenreel plan, then screenreel beautify.",
+        "message": "Live take stopped. Scripted lessons use screenreel make lesson.yaml on this machine.",
     })
 
 
@@ -312,39 +327,18 @@ def mark(args):
     label = flag(args, "--label")
     if not label:
         emit({"ok": False, "error": "--label needs the step name"})
-    line = json.dumps({"t": 0, "type": "marker", "label": label}) + "\n"
-    with open(os.path.join(take, INBOX), "a", encoding="utf-8") as handle:
-        handle.write(line)
-    emit({"ok": True, "take": take, "label": label, "queued": True})
+    mono = append_mark(os.path.join(take, INBOX), label)
+    emit({"ok": True, "take": take, "label": label, "mono": mono, "queued": True})
 
 
 def _drain_inbox(take, events, started, offset):
     path = os.path.join(take, INBOX)
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as handle:
-        handle.seek(offset)
-        for line in handle:
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            label = payload.get("label")
-            if not label:
-                continue
-            events.write(json.dumps({
-                "t": round(time.monotonic() - started, 3),
-                "type": "marker",
-                "label": label,
-            }) + "\n")
-            events.flush()
-
-
-def _inbox_size(take):
-    path = os.path.join(take, INBOX)
-    if not os.path.exists(path):
-        return 0
-    return os.path.getsize(path)
+    drained, new_offset = drain_inbox(path, offset, started, drain_mono=time.monotonic())
+    for payload in drained:
+        events.write(json.dumps(payload, sort_keys=True) + "\n")
+    if drained:
+        events.flush()
+    return new_offset
 
 
 def _readline(process):
@@ -377,8 +371,12 @@ def _fail(take, message):
 
 def main():
     args = sys.argv[1:]
+    usage = (
+        "screenreel doctor | record start --take <dir> | mark --take <dir> --label <text> | "
+        "record stop --take <dir> | make <lesson.yaml> | inspect <lesson.yaml> | login --profile <name>"
+    )
     if not args or args[0] in ("help", "--help", "-h"):
-        emit({"ok": False, "error": "screenreel doctor | record start --take <dir> | mark --take <dir> --label <text> | record stop --take <dir>"})
+        emit({"ok": True, "commands": usage})
     command = args[0]
     if command == "doctor":
         doctor()
@@ -391,7 +389,28 @@ def main():
             record_stop(args[2:])
         if args[1] == "run":
             record_run(args[2:])
-    emit({"ok": False, "error": "Unknown command. On Linux this tool records. Beautify the take on the Mac."})
+    if command in ("make", "inspect", "login", "lint"):
+        from screenreel_make.command import cmd_inspect, cmd_login, cmd_make
+        from screenreel_make.lesson import LessonError, load_lesson
+        try:
+            if command == "make":
+                payload = cmd_make(args[1:])
+            elif command == "inspect":
+                payload = cmd_inspect(args[1:])
+            elif command == "login":
+                payload = cmd_login(args[1:])
+            else:
+                flags = [arg for arg in args[1:] if not arg.startswith("--")]
+                if not flags:
+                    raise LessonError("screenreel lint <lesson.yaml>")
+                lesson = load_lesson(flags[0])
+                payload = {"ok": True, "lesson": lesson.lesson, "steps": [step.id for step in lesson.steps]}
+        except LessonError as error:
+            payload = error.payload()
+        except Exception as error:  # noqa: BLE001 - one JSON object on stdout
+            payload = {"ok": False, "error": str(error), "code": "make_failed"}
+        emit(payload)
+    emit({"ok": False, "error": "Unknown command. " + usage})
 
 
 if __name__ == "__main__":

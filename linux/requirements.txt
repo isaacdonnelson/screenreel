@@ -1,0 +1,6 @@
+pyyaml
+playwright
+opencv-python-headless
+numpy
+pillow
+pytest

@@ -11,6 +11,8 @@ struct Segment: Equatable {
 struct Cut: Equatable {
     var start: Double
     var end: Double
+    var id: String? = nil
+    var manual: Bool = false
 }
 
 struct CoverRect: Equatable {
@@ -202,6 +204,40 @@ private func splitInterval(_ start: Double, _ end: Double, segments: [Segment]) 
     return parts
 }
 
+func cutKey(_ cut: Cut) -> String {
+    if let id = cut.id, !id.isEmpty { return "id:" + id }
+    return String(format: "span:%.3f:%.3f", cut.start, cut.end)
+}
+
+/// Regenerated auto cuts plus hand cuts and overrides. Previous auto cuts are replaced.
+func mergeCuts(newAuto: [Cut], previousAuto: [Cut], existing: [Cut], overrides: [Cut]) -> [Cut] {
+    let previous = Set(previousAuto.map(cutKey))
+    let autoKeys = Set(newAuto.map(cutKey))
+    var manual: [Cut] = []
+    for cut in existing {
+        let key = cutKey(cut)
+        if previous.contains(key) || autoKeys.contains(key) { continue }
+        if let id = cut.id, id.hasPrefix("auto-"), !cut.manual { continue }
+        manual.append(cut)
+    }
+    var merged = newAuto
+    var seen = Set(newAuto.map(cutKey))
+    for cut in manual + overrides {
+        let key = cutKey(cut)
+        if seen.contains(key) { continue }
+        merged.append(cut)
+        seen.insert(key)
+    }
+    return merged.sorted { lhs, rhs in
+        if lhs.start == rhs.start { return lhs.end < rhs.end }
+        return lhs.start < rhs.start
+    }
+}
+
+func rippleAge(outputTime: Double, eventSourceTime: Double, map: TimeMap) -> Double {
+    outputTime - map.outputTime(at: eventSourceTime)
+}
+
 func actionTimes(_ events: [Event]) -> [Double] {
     events.compactMap { event in
         switch event.type {
@@ -315,10 +351,26 @@ func planCommand(takePath: String) async -> [String: Any] {
             }
         }
         let timing = plannedTiming(events: events, duration: duration, steps: edit.steps)
+        let autoCuts = timing.cuts.enumerated().map { index, cut in
+            Cut(start: cut.start, end: cut.end, id: "auto-cut-\(index + 1)", manual: false)
+        }
+        let autoURL = take.appendingPathComponent("auto.json")
+        let previousAuto = loadCuts(from: readJSONObject(at: autoURL)?["cuts"])
+        let overrideURL = take.appendingPathComponent("overrides.json")
+        let overrideCuts = loadCuts(from: readJSONObject(at: overrideURL)?["cuts"])
+        let mergedCuts = mergeCuts(newAuto: autoCuts, previousAuto: previousAuto, existing: edit.cuts, overrides: overrideCuts)
         edit.segments = timing.segments
-        edit.cuts = timing.cuts
+        edit.cuts = mergedCuts
         edit.blurs.append(contentsOf: secretBlurs(events: events, sourceSize: edit.sourceSize, existing: edit.blurs))
+        let autoObject = editObject(from: edit)
+        var autoOnly = autoObject
+        autoOnly["cuts"] = autoCuts.map { cut -> [String: Any] in
+            ["end": (cut.end * 1000).rounded() / 1000, "id": cut.id ?? "", "start": (cut.start * 1000).rounded() / 1000]
+        }
+        autoOnly["segments"] = timing.segments.map { ["end": ($0.end * 1000).rounded() / 1000, "speed": ($0.speed * 1000).rounded() / 1000, "start": ($0.start * 1000).rounded() / 1000] }
+        try writeJSONObject(autoOnly, to: autoURL)
         try writeJSONObject(editObject(from: edit), to: editURL)
+        try writeJSONObject(editObject(from: edit), to: take.appendingPathComponent("plan.json"))
         let map = buildTimeMap(duration: duration, segments: edit.segments, cuts: edit.cuts)
         let size = edit.sourceSize ?? .zero
         return [
@@ -388,7 +440,8 @@ func markCommand(takePath: String, label: String, at: Double?) -> [String: Any] 
         return ["ok": false, "error": "Nothing is recording in \(take.path). Pass --at to mark a finished take."]
     }
     let inbox = take.appendingPathComponent("inbox.jsonl")
-    let line = markerJSON(label: trimmed, time: 0) + "\n"
+    let called = ProcessInfo.processInfo.systemUptime
+    let line = "{\"mono\":\(String(format: "%.6f", called))," + String(markerJSON(label: trimmed, time: called).dropFirst()) + "\n"
     if let handle = FileHandle(forWritingAtPath: inbox.path) {
         handle.seekToEndOfFile()
         handle.write(Data(line.utf8))
@@ -413,6 +466,14 @@ func mediaDuration(_ url: URL) async throws -> Double {
         throw ToolError("The recording has no duration")
     }
     return duration
+}
+
+private func loadCuts(from value: Any?) -> [Cut] {
+    guard let cuts = value as? [[String: Any]] else { return [] }
+    return cuts.compactMap { cut in
+        guard let start = jsonDouble(cut["start"]), let end = jsonDouble(cut["end"]) else { return nil }
+        return Cut(start: start, end: end, id: cut["id"] as? String, manual: cut["manual"] as? Bool ?? false)
+    }
 }
 
 private func secretBlurs(events: [Event], sourceSize: CGSize?, existing: [BlurRect]) -> [BlurRect] {

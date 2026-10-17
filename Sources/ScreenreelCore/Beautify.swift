@@ -97,9 +97,10 @@ private func renderTake(_ take: URL, preview: Bool) async throws -> [String: Any
     let clicks = events.filter { $0.type == "click" || $0.type == "down" }
     let ciContext = CIContext(options: [.cacheIntermediates: false])
     let fallback = CGPoint(x: sourceSize.width / 2, y: sourceSize.height / 2)
-    let cursors = cursorTrack(events: scaledEvents(events, from: edit.sourceSize, to: sourceSize), frameCount: sourceFrameCount, fps: Double(fps), fallback: fallback)
+    let scaledEventsForCursor = scaledEvents(events, from: edit.sourceSize, to: sourceSize)
+    let cursors = cursorTrackOutput(events: scaledEventsForCursor, frameCount: frameCount, fps: Double(fps), map: map, fallback: fallback)
     let scaledClicks = scaledEvents(clicks, from: edit.sourceSize, to: sourceSize)
-    let scaledZooms = scaleZooms(zooms, from: edit.sourceSize, to: sourceSize)
+    let scaledZooms = zoomsOnOutputClock(scaleZooms(zooms, from: edit.sourceSize, to: sourceSize), map: map, style: edit.style)
     let scaledBlurs = scaleBlurs(edit.blurs, from: edit.sourceSize, to: sourceSize)
 
     var written = 0
@@ -121,12 +122,11 @@ private func renderTake(_ take: URL, preview: Bool) async throws -> [String: Any
                 sourceSize = CGSize(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
             }
             let image = try cgImage(from: buffer)
-            let cursorIndex = min(cursors.count - 1, max(0, Int((time * Double(fps)).rounded())))
-            let cursor = cursors.isEmpty ? fallback : cursors[cursorIndex]
-            let shot = camera(at: time, zooms: scaledZooms, style: edit.style, cursor: cursor)
+            let cursor = cursors.isEmpty ? fallback : cursors[min(cursors.count - 1, index)]
+            let shot = cameraOutput(at: outputTime, zooms: scaledZooms, cursor: cursor)
             let ripples = scaledClicks.compactMap { click -> Ripple? in
-                let age = time - click.t
-                guard age >= 0, age <= 0.42 else { return nil }
+                let age = rippleAge(outputTime: outputTime, eventSourceTime: click.t, map: map)
+                guard age >= 0, age <= 0.45 else { return nil }
                 return Ripple(x: click.x, y: click.y, age: age)
             }
             let blursNow = scaledBlurs.filter { blur in

@@ -1,0 +1,143 @@
+# TestFiesta lesson 3-1. Selectors are placeholders until `screenreel inspect` confirms them.
+# URL and credentials come from the environment. Do not put secrets in this file.
+lesson: "3-1"
+title: "Create a run and mark a result"
+output: takes/3-1/out.mp4
+
+app:
+  base_url: ${TESTFIESTA_URL}
+  username: ${TESTFIESTA_USER}
+  password: ${TESTFIESTA_PASSWORD}
+  profile: testfiesta
+  viewport: {width: 1440, height: 810, scale: 1.333}
+  allowed_origins: ["${TESTFIESTA_URL}"]
+  hide:
+    - "#intercom-container"
+    - ".intercom-lightweight-app"
+  mask:
+    - {selector: "[data-testid=workspace-switcher]", mode: replace, text: "Shopfront Team"}
+  never_show: ["@gmail.com", "isaac"]
+
+style:
+  background: "#1E1B4B"
+  radius: 16
+  accent: "#4F46E5"
+  cursor_scale: 1.0
+  max_zoom: 1.6
+  motion_blur: cursor
+  captions: burn
+  step_chip: true
+  title_card: {seconds: 3.0}
+  end_card: {seconds: 3.0, line: "Next lesson in TestFiesta Academy"}
+
+voice:
+  provider: elevenlabs
+  voice_id: 7EzWGsX10sAS4c9m9cPf
+  model: eleven_v3
+  lead: -0.08
+
+audio:
+  music: ""
+  duck_db: -12
+  sfx: {click: default, keys: default, whoosh: off}
+  lufs: -14
+  true_peak: -1.0
+
+setup:
+  - goto: "/projects/SHOP/test-runs"
+  - script: archive_runs_named
+    args: {prefix: "Cart checkout smoke"}
+
+intro:
+  say: "Let's create a test run and record a result. A run is one pass through the cases you pick, so the team has one place to see what was tested and how it went."
+
+steps:
+  - id: create
+    label: "Create a test run"
+    say: "Open Test runs and click Create test run. Results live inside a run, not in the case itself, so the same case can be run again and again."
+    do:
+      - goto: "/projects/SHOP/test-runs"
+      - click: {role: button, name: "Create test run"}
+        at: "Create"
+        result: {text: "Create test run", role: heading}
+
+  - id: name
+    label: "Name the run"
+    say: "Name it Cart checkout smoke, October 16. A clear name tells everyone exactly which pass they're reading later."
+    do:
+      - click: {role: textbox, name: "Name"}
+        at: "Name"
+      - type: "Cart checkout smoke - Oct 16"
+        at: "Cart"
+        expect_value: "Cart checkout smoke - Oct 16"
+
+  - id: start-date
+    label: "Start date"
+    say: "Pick a Start Date. The name and both dates are required, which ties every run to a real window of time."
+    do:
+      - click: {label: "Start Date"}
+        at: "Start"
+        result: {role: dialog}
+      - click: {role: gridcell, name: "16", within: {role: dialog}}
+        at: "required"
+
+  - id: due-date
+    label: "Due date"
+    say: "Then pick a Due Date. A run with a deadline lets the team see whether testing is on track for the release."
+    do:
+      - click: {label: "Due Date"}
+        at: "Due"
+        result: {role: dialog}
+      - click: {role: gridcell, name: "23", within: {role: dialog}}
+        at: "deadline"
+    note: "Known display bug: the field may show 10/22/26 after picking the 23rd. Narration avoids reading the date aloud."
+
+  - id: next
+    label: "Next: choose cases"
+    say: "Click Next. This form only sets up the run. What you actually test comes on the next screen."
+    do:
+      - scroll_into_view: {role: button, name: "Next"}
+      - click: {role: button, name: "Next"}
+        at: "Next"
+        wait_for: {text: "Add test cases"}
+
+  - id: tick
+    label: "Tick the case"
+    say: "Tick only the case you need, here SHOP 1520, guest can add an item to the cart. A focused run shows clearly whether this change works."
+    do:
+      - click: {role: checkbox, within: {role: row, has_text: "SHOP-1520"}}
+        at: "Tick"
+        result: {role: row, has_text: "SHOP-1520"}
+
+  - id: save
+    label: "Save the run"
+    say: "Click Save, and the run shows up in the list. Each case you add gets its own id inside the run, so its result is tracked here without changing the original case."
+    keep_toasts: true
+    do:
+      - click: {role: button, name: "Save"}
+        at: "Save"
+        wait_for: {text: "Cart checkout smoke - Oct 16"}
+        result: {role: row, has_text: "Cart checkout smoke - Oct 16"}
+
+  - id: open
+    label: "Open the run and the case"
+    say: "Open the run, then click the case. This is where you record what the screen actually did."
+    do:
+      - click: {role: link, name: "Cart checkout smoke - Oct 16"}
+        at: "run"
+        wait_for: {text: "Guest can add an item to the cart"}
+      - click: {text: "Guest can add an item to the cart"}
+        at: "case"
+        result: {role: complementary}
+
+  - id: passed
+    label: "Mark Passed"
+    say: "Set the status to Passed only when you ran the steps and the screen matched. A fake pass hides a bug that customers then find, and the run's progress updates right away."
+    do:
+      - click: {role: button, name: "Active"}
+        at: "status"
+        result: {role: listbox}
+      - click: {role: option, name: "Passed"}
+        at: "Passed"
+        result: {text: "100%"}
+      - hold: 1.0

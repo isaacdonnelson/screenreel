@@ -215,6 +215,7 @@ final class Recorder: NSObject, SCStreamOutput {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
         videoQueue.sync {}
+        drainMarks()
         writerInput?.markAsFinished()
         if let writer {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -361,13 +362,19 @@ final class Recorder: NSObject, SCStreamOutput {
             return
         }
         let data = handle.readDataToEndOfFile()
-        inboxOffset = handle.offsetInFile
         guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-        let uptime = ProcessInfo.processInfo.systemUptime
-        for raw in text.split(separator: "\n") where raw.contains("\"label\"") {
+        let newline = text.last == "\n" ? text : String(text.prefix(upTo: text.lastIndex(of: "\n") ?? text.endIndex))
+        if text.last != "\n", text.lastIndex(of: "\n") == nil { return }
+        let consumed = newline.utf8.count
+        inboxOffset += UInt64(consumed)
+        let drainedAt = ProcessInfo.processInfo.systemUptime
+        for raw in newline.split(separator: "\n") where raw.contains("\"label\"") {
             guard let object = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any],
                   let label = object["label"] as? String else { continue }
-            enqueue(uptime: uptime, line: markerJSON(label: label, time: 0))
+            let stamped = jsonDouble(object["mono"])
+            let legacy = jsonDouble(object["t"]) ?? 0
+            let called = stamped ?? (legacy > 1 ? legacy : drainedAt)
+            enqueue(uptime: called, line: markerJSON(label: label, time: 0))
         }
     }
 
